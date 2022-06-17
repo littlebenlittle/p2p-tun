@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "3.1.10", features = ["derive"] }
-libp2p = { version = "0.44" }
+libp2p = { version = "0.44", features = ["serde"] }
 libp2p-swarm = { version = "0.35" }
 async-std = { version = "1.6.2", features = ["attributes"] }
 futures = "0.3.1"
@@ -19,3 +19,4 @@ async-tun = "0.10"
 bimap = "0.6"
 serde = { version = "1.0", features = [ "derive"] }
 serde_yaml = "0.8"
+users = "0.11"

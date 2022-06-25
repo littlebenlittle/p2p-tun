@@ -1,0 +1,22 @@
+services:
+
+  client-peer:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    cap_add:
+      - CAP_NET_ADMIN
+      - CAP_MKNOD
+
+  exit-peer:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    cap_add:
+      - CAP_NET_ADMIN
+      - CAP_MKNOD
+
+  service:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile

@@ -25,7 +25,7 @@ TUN=$(docker-compose exec -i client-peer p2p-tun run --daemon --print-device)
 docker-compose exec exit-peer p2p-tun run --daemon
 
 # configure ip4 routes on client
-docker-compose exec client-peer ip route add 10.1.2.1/32 dev "$TUN"
+docker-compose exec client-peer ip route add 10.1.1.1/32 dev "$TUN" mtu 1500
 docker-compose exec client-peer ip route add 0.0.0.0/0 via 10.1.1.1
 
 # pause and then run ping on client

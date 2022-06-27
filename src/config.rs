@@ -13,7 +13,8 @@ pub struct VpnPeer {
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {
-    private_key: Vec<u8>,
+    //TODO: implement serde for keypair as multicodec
+    keypair: Keypair,
     peer_id: PeerId,
     listen: Multiaddr,
     peers: Vec<VpnPeer>,
@@ -21,10 +22,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn private_key(&mut self) -> Result<Keypair, Box<dyn std::error::Error + Sync + Send>> {
-        Ok(Keypair::Ed25519(
-            libp2p::identity::ed25519::Keypair::decode(&mut self.private_key)?,
-        ))
+    pub fn keypair(&mut self) -> Keypair {
     }
     #[allow(dead_code)]
     pub fn peer_id(&self) -> PeerId {

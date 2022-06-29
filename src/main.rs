@@ -1,20 +1,22 @@
 mod behaviour;
 mod client;
 mod config;
-mod packet;
+// mod packet;
 mod request_response;
 
 use behaviour::{Behaviour, Event};
 use client::Client;
 use config::Config;
-use packet::{Packet, PACKET_LEN};
+// use packet::{Packet, PACKET_LEN};
 use request_response::{PacketStreamCodec, PacketStreamProtocol};
 
-use libp2p::PeerId;
 use bimap::BiMap;
 use clap::{Parser, Subcommand};
+use libp2p::PeerId;
 use log;
 use std::{net::Ipv4Addr, path::PathBuf, str::FromStr};
+
+pub(crate) const MTU_SIZE: usize = 1500;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Sync + Send>>;
 
@@ -84,6 +86,12 @@ fn main() -> Result<()> {
                     .listen(cfg.listen())
                     .build()
                     .unwrap();
+                client.create_tun().await?;
+                if let Some(user) = users::get_user_by_name(&cfg.user()) {
+                    users::switch::set_effective_uid(user.uid());
+                } else {
+                    return Err(Error::InvalidUser);
+                }
                 client.run().await
             })?;
         }

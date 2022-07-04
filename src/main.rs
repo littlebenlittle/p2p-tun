@@ -1,13 +1,13 @@
 mod behaviour;
 mod client;
 mod config;
-// mod packet;
+mod packet;
 mod request_response;
 
 use behaviour::{Behaviour, Event};
 use client::Client;
 use config::Config;
-// use packet::{Packet, PACKET_LEN};
+use packet::{Packet, MTU, Port};
 use request_response::{PacketStreamCodec, PacketStreamProtocol};
 
 use bimap::BiMap;
@@ -86,12 +86,6 @@ fn main() -> Result<()> {
                     .listen(cfg.listen())
                     .build()
                     .unwrap();
-                client.create_tun().await?;
-                if let Some(user) = users::get_user_by_name(&cfg.user()) {
-                    users::switch::set_effective_uid(user.uid());
-                } else {
-                    return Err(Error::InvalidUser);
-                }
                 client.run().await
             })?;
         }

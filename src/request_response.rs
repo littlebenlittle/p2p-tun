@@ -5,14 +5,48 @@ use libp2p::core::upgrade::{read_length_prefixed, write_length_prefixed, Protoco
 use libp2p::request_response::RequestResponseCodec;
 use std::convert::TryInto;
 
-use crate::{Packet, PACKET_LEN};
+use crate::{Packet, MTU};
 
 #[derive(Clone, Default)]
 pub struct PacketStreamProtocol;
 
 impl ProtocolName for PacketStreamProtocol {
     fn protocol_name(&self) -> &[u8] {
-        "/packet-stream-1500/1".as_bytes()
+        "/p2p-vpn/0.0.0".as_bytes()
+    }
+}
+
+pub enum PacketRequest {
+    // request to submit packet to network
+    ToNet(Packet),
+    // request to submit packet to TUN device
+    ToTun(Packet),
+}
+
+impl PacketRequest {
+    pub fn to_wire_format(&self) -> Vec<u8> {
+        let mut data = Vec::<u8>::with_capacity(1 + self.get_inner().len());
+        data[0] = match self {
+            Self::ToNet(_) => 0u8,
+            Self::ToTun(packet) => 1u8,
+        };
+        data[1..].copy_from_slice(&self.get_inner().to_wire_format());
+        data
+    }
+
+    pub fn from_wire_format(data: &[u8]) -> io::Result<Self> {
+        let packet = Packet::from_wire_format(&data[1..])?;
+        match data[0] {
+            0 => Ok(Self::ToNet(packet)),
+            1 => Ok(Self::ToTun(packet)),
+            _ => Err(io::ErrorKind::InvalidData.into())
+        }
+    }
+
+    fn get_inner(&self) -> &Packet {
+        match self {
+            Self::ToNet(packet) | Self::ToTun(packet) => packet,
+        }
     }
 }
 
@@ -22,7 +56,7 @@ pub struct PacketStreamCodec;
 #[async_trait]
 impl RequestResponseCodec for PacketStreamCodec {
     type Protocol = PacketStreamProtocol;
-    type Request = Packet;
+    type Request = PacketRequest;
     type Response = ();
 
     async fn read_request<T>(
@@ -33,14 +67,27 @@ impl RequestResponseCodec for PacketStreamCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let packet: Packet = {
-            let vec = read_length_prefixed(io, PACKET_LEN).await?;
-            if vec.is_empty() {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            vec.try_into()?
-        };
-        Ok(packet)
+        // TODO should we use a length prefix if we know MTU?
+        let vec = read_length_prefixed(io, MTU).await?;
+        if vec.is_empty() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        PacketRequest::from_wire_format(&vec)
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &PacketStreamProtocol,
+        io: &mut T,
+        request: PacketRequest,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        // TODO should we use a length prefix if we know MTU?
+        write_length_prefixed(io, request.to_wire_format()).await?;
+        io.close().await?;
+        Ok(())
     }
 
     async fn read_response<T>(
@@ -51,21 +98,7 @@ impl RequestResponseCodec for PacketStreamCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        Ok(())
-    }
-
-    async fn write_request<T>(
-        &mut self,
-        _: &PacketStreamProtocol,
-        io: &mut T,
-        packet: Packet,
-    ) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        let vec: Vec<u8> = packet.into();
-        write_length_prefixed(io, vec).await?;
-        io.close().await?;
+        // should never receive response
         Ok(())
     }
 
@@ -78,6 +111,7 @@ impl RequestResponseCodec for PacketStreamCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
+        // no response
         Ok(())
     }
 }

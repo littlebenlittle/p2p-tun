@@ -1,4 +1,4 @@
-use crate::{Packet, PacketStreamCodec, PacketStreamProtocol, Result};
+use crate::{PacketRequest, PacketStreamCodec, PacketStreamProtocol, Result};
 use libp2p::{
     identify::{Identify, IdentifyConfig, IdentifyEvent},
     identity,
@@ -31,13 +31,13 @@ impl Behaviour {
 
 #[derive(Debug)]
 pub enum Event {
-    RequestResponse(RequestResponseEvent<Packet, ()>),
+    RequestResponse(RequestResponseEvent<PacketRequest, ()>),
     Kademlia(KademliaEvent),
     Identify(IdentifyEvent),
 }
 
-impl From<RequestResponseEvent<Packet, ()>> for Event {
-    fn from(e: RequestResponseEvent<Packet, ()>) -> Self {
+impl From<RequestResponseEvent<PacketRequest, ()>> for Event {
+    fn from(e: RequestResponseEvent<PacketRequest, ()>) -> Self {
         Self::RequestResponse(e)
     }
 }

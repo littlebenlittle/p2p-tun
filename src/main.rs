@@ -1,3 +1,9 @@
+#[cfg(test)]
+extern crate quickcheck;
+#[cfg(test)]
+#[macro_use(quickcheck)]
+extern crate quickcheck_macros;
+
 mod behaviour;
 mod client;
 mod config;
@@ -7,8 +13,8 @@ mod request_response;
 use behaviour::{Behaviour, Event};
 use client::Client;
 use config::Config;
-use packet::{Packet, MTU, Port};
-use request_response::{PacketStreamCodec, PacketStreamProtocol};
+use packet::{Packet, MTU, Port, Transport};
+use request_response::{PacketStreamCodec, PacketStreamProtocol, PacketRequest};
 
 use bimap::BiMap;
 use clap::{Parser, Subcommand};

@@ -10,7 +10,7 @@ pub const MTU: usize = 1420;
 
 pub type Port = u16;
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Packet {
     transport: Transport,
     saddr: Ipv4Addr,
@@ -80,10 +80,6 @@ impl Packet {
         })
     }
 
-    pub fn len(&self) -> usize {
-        unimplemented!()
-    }
-
     pub async fn read_packet<T: AsyncRead + Unpin>(reader: &mut T) -> Result<Packet> {
         let mut buf = [0u8; MTU];
         let nbytes: usize = reader.read(&mut buf).await?;
@@ -106,8 +102,8 @@ impl Packet {
     }
 }
 
-#[derive(PartialEq)]
-enum Transport {
+#[derive(Debug, PartialEq, Clone)]
+pub enum Transport {
     Tcp {
         sport: Port,
         dport: Port,
@@ -130,9 +126,9 @@ impl Transport {
             } => {
                 let mut data = Vec::<u8>::with_capacity(5 + payload.len());
                 data[0] = 0;
-                data[1] = ((sport >> 8) & 0xff) as u8;
+                data[1] = (sport >> 8 & 0xff) as u8;
                 data[2] = (sport & 0xff) as u8;
-                data[3] = ((dport >> 8) & 0xff) as u8;
+                data[3] = (dport >> 8 & 0xff) as u8;
                 data[4] = (dport & 0xff) as u8;
                 data[5..].copy_from_slice(&payload);
                 data
@@ -157,8 +153,8 @@ impl Transport {
     fn from_wire_format(data: &[u8]) -> io::Result<Self> {
         match data[0] {
             0 => {
-                let payload = Vec::<u8>::with_capacity(data.len() - 4);
-                payload.copy_from_slice(&data[5..]);
+                let payload = Vec::<u8>::with_capacity(data.len() - 11);
+                payload.copy_from_slice(&data[11..]);
                 Ok(Self::Tcp {
                     sport: ((data[1] << 8) | data[2]) as u16,
                     dport: ((data[3] << 8) | data[4]) as u16,
@@ -206,26 +202,46 @@ impl std::fmt::Display for Error {
 #[cfg(test)]
 mod test {
     use super::*;
+    use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
 
-    #[test]
-    fn transport_wire_format_encode_decode() {
-        for sport in 0..0xff {
-            for dport in 0..0xff {
-                let payload = vec![1, 2, 3];
-                let tcp = Transport::Tcp {
-                    sport,
-                    dport,
-                    payload,
-                };
-                let udp = Transport::Udp {
-                    sport,
-                    dport,
-                    payload,
-                };
-                assert_eq!(tcp, Transport::from_wire_format(&tcp.to_wire_format()));
-                assert_eq!(udp, Transport::from_wire_format(&udp.to_wire_format()));
+    impl Arbitrary for Transport {
+        fn arbitrary(g: &mut Gen) -> Transport {
+            *g.choose(&[
+                Transport::Tcp {
+                    sport: u16::arbitrary(g),
+                    dport: u16::arbitrary(g),
+                    payload: Vec::<u8>::arbitrary(g),
+                },
+                Transport::Udp {
+                    sport: u16::arbitrary(g),
+                    dport: u16::arbitrary(g),
+                    payload: Vec::<u8>::arbitrary(g),
+                },
+            ])
+            .unwrap()
+        }
+    }
+
+    impl Arbitrary for Packet {
+        fn arbitrary(g: &mut Gen) -> Packet {
+            Packet {
+                transport: Transport::arbitrary(g),
+                saddr: Ipv4Addr::arbitrary(g),
+                daddr: Ipv4Addr::arbitrary(g),
             }
         }
+    }
+
+    fn wire_format_encode_decode(packet: Packet) -> TestResult {
+        if packet.transport.payload().len() >= MTU {
+            return TestResult::discard();
+        }
+        TestResult::from_bool(packet == Packet::from_wire_format(&packet.to_wire_format()).unwrap())
+    }
+
+    #[test]
+    fn quickcheck_test() {
+        quickcheck(wire_format_encode_decode as fn(Packet) -> TestResult)
     }
 }
 

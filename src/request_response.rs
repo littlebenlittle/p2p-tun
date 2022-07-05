@@ -16,6 +16,7 @@ impl ProtocolName for PacketStreamProtocol {
     }
 }
 
+#[derive(Debug)]
 pub enum PacketRequest {
     // request to submit packet to network
     ToNet(Packet),
@@ -25,12 +26,13 @@ pub enum PacketRequest {
 
 impl PacketRequest {
     pub fn to_wire_format(&self) -> Vec<u8> {
-        let mut data = Vec::<u8>::with_capacity(1 + self.get_inner().len());
+        let inner_data = self.get_inner().to_wire_format();
+        let mut data = Vec::<u8>::with_capacity(1 + inner_data.len());
         data[0] = match self {
             Self::ToNet(_) => 0u8,
             Self::ToTun(packet) => 1u8,
         };
-        data[1..].copy_from_slice(&self.get_inner().to_wire_format());
+        data[1..].copy_from_slice(&inner_data);
         data
     }
 

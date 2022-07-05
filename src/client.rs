@@ -1,17 +1,9 @@
-use crate::{Behaviour, Event, Packet, Port, Result, MTU};
+use crate::{Behaviour, Event, Packet, PacketRequest, Port, Result, Transport, MTU};
 use async_std::net::{SocketAddr, TcpStream, UdpSocket};
-use async_tun::{Tun, TunBuilder};
+use async_tun::TunBuilder;
 // use bimap::BiMap;
 use cidr::Ipv4Cidr;
-use etherparse::{
-    InternetSlice, IpNumber, Ipv4Header, Ipv4HeaderSlice, SlicedPacket, TcpHeaderSlice,
-    TransportSlice, UdpHeaderSlice, {TcpHeader, UdpHeader},
-};
-use futures::{
-    future::{select_all, try_join_all},
-    prelude::*,
-    select,
-};
+use futures::{prelude::*, select};
 use libp2p::{
     development_transport,
     identify::{IdentifyEvent, IdentifyInfo},
@@ -21,19 +13,16 @@ use libp2p::{
     Multiaddr, PeerId, Swarm,
 };
 
-use std::{
-    collections::{HashMap, VecDeque},
-    io::Result as IoResult,
-    net::{IpAddr, Ipv4Addr},
-    path::PathBuf,
-    str::FromStr,
-};
+use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
 
 #[derive(Debug)]
 pub enum Error {
     NoPeerRegisteredForIpv4Addr,
     UnnecessaryRootPriveliges,
-    TunNotCreated,
+    UnsupportedInternetProtocol,
+    UnsupportedTransportProtocol,
+    UnknownPeer,
+    NoMatchCidr,
 }
 
 impl std::error::Error for Error {}
@@ -44,15 +33,13 @@ impl std::fmt::Display for Error {
             Error::NoPeerRegisteredForIpv4Addr => {
                 fmt.write_str("no peer registered for ipv4 address")
             }
-            Error::TunNotCreated => fmt.write_str(
-                "tun device hasn't been created; use client.create_tun() before calling run()",
-            ),
         }
     }
 }
 
 struct Peer {
-    tcp_streams: HashMap<(Ipv4Addr, Port), TcpStream>,
+    /// stores open streams and seq number
+    tcp_streams: HashMap<(Ipv4Addr, Port), (TcpStream, u32)>,
     udp_sockets: HashMap<(Ipv4Addr, Port), UdpSocket>,
 }
 
@@ -63,6 +50,9 @@ pub struct Client {
     /// client's p2p swarm listen address
     listen: Multiaddr,
     peers: HashMap<PeerId, Peer>,
+    /// packets sent from the network through an exit
+    /// to this peer will be given this ipv4 source address
+    ipv4_addr: Ipv4Addr,
     /// incoming TUN packets matching any CIDR will be sent to the
     /// associated peer
     forward_cidrs: HashMap<PeerId, Vec<Ipv4Cidr>>,
@@ -79,28 +69,48 @@ struct ClientBuilder {
     keypair: Option<Keypair>,
     listen: Option<Multiaddr>,
     user: Option<String>,
+    ipv4_addr: Option<Ipv4Addr>,
 }
 
 impl ClientBuilder {
+    /// set the keypair of p2p swarm peer
     pub fn keypair(self, keypair: Keypair) -> Self {
         Self {
             keypair: Some(keypair),
             listen: self.listen,
             user: self.user,
+            ipv4_addr: self.ipv4_addr,
         }
     }
+
+    /// set the listen address of p2p swarm
     pub fn listen<M: Into<Multiaddr>>(self, listen: M) -> Self {
         Self {
             listen: Some(listen.into()),
             keypair: self.keypair,
             user: self.user,
+            ipv4_addr: self.ipv4_addr,
         }
     }
+
+    /// set the user that p2p swarm will run as
     pub fn user(self, user: String) -> Self {
         Self {
             listen: self.listen,
             keypair: self.keypair,
             user: Some(user),
+            ipv4_addr: self.ipv4_addr,
+        }
+    }
+
+    /// set the ipv4 dest address for packets sent to
+    /// the TUN device
+    pub fn ipv4_addr(self, ipv4_addr: Ipv4Addr) -> Self {
+        Self {
+            listen: self.listen,
+            keypair: self.keypair,
+            user: self.user,
+            ipv4_addr: Some(ipv4_addr),
         }
     }
 
@@ -108,11 +118,13 @@ impl ClientBuilder {
         let keypair = self.keypair?;
         let listen = self.listen?;
         let user = users::get_user_by_name(&self.user?)?;
+        let ipv4_addr = self.ipv4_addr?;
         Some(Client {
             listen,
             peer_id: keypair.public().to_peer_id(),
             keypair,
             user,
+            ipv4_addr,
             peers: HashMap::new(),
             cached_ipv4_peer: HashMap::new(),
             exit_cidrs: HashMap::new(),
@@ -127,6 +139,7 @@ impl Client {
             keypair: None,
             listen: None,
             user: None,
+            ipv4_addr: None,
         }
     }
 
@@ -153,25 +166,28 @@ impl Client {
         peer_id: &PeerId,
         dst_addr: &Ipv4Addr,
         dst_port: &Port,
-    ) -> Result<&mut TcpStream> {
+    ) -> Result<&mut (TcpStream, u32)> {
         // TODO maybe macro?
         if let Some(peer) = self.peers.get_mut(peer_id) {
             // check if we already opened a tcp stream for this peer, addr, port
-            if let Some(tcp_stream) = peer.tcp_streams.get_mut(&(*dst_addr, *dst_port)) {
-                return Ok(tcp_stream);
-            }
-            // check if we are acting as an exit for this peer on this addr
-            for cidrs in self.exit_cidrs.get(peer_id) {
-                for cidr in cidrs {
-                    if cidr.contains(dst_addr) {
-                        let tcp_stream = TcpStream::connect((*dst_addr, *dst_port)).await?;
-                        self.tcp_streams.push(tcp_stream);
-                        peer.tcp_streams.insert((*dst_addr, *dst_port), &tcp_stream);
-                        return Ok(&mut tcp_stream);
+            if peer.tcp_streams.get_mut(&(*dst_addr, *dst_port)).is_none() {
+                // check if we are acting as an exit for this peer on this addr
+                let mut found = false;
+                for cidrs in self.exit_cidrs.get(peer_id) {
+                    for cidr in cidrs {
+                        if cidr.contains(dst_addr) {
+                            let tcp_stream = TcpStream::connect((*dst_addr, *dst_port)).await?;
+                            peer.tcp_streams
+                                .insert((*dst_addr, *dst_port), (tcp_stream, 0));
+                            found = true;
+                        }
                     }
                 }
+                if !found {
+                    return Err(Box::new(Error::NoMatchCidr));
+                }
             }
-            return Err(Box::new(Error::NoMatchCidr));
+            return Ok(peer.tcp_streams.get_mut(&(*dst_addr, *dst_port)).unwrap());
         }
         Err(Box::new(Error::UnknownPeer))
     }
@@ -187,21 +203,23 @@ impl Client {
     ) -> Result<&mut UdpSocket> {
         if let Some(peer) = self.peers.get_mut(peer_id) {
             // check if we already opened a tcp stream for this peer, addr, port
-            if let Some(tcp_stream) = peer.udp_sockets.get_mut(&(*addr, *port)) {
-                return Ok(tcp_stream);
-            }
-            // check if we are acting as an exit for this peer on this addr
-            for cidrs in self.exit_cidrs.get(peer_id) {
-                for cidr in cidrs {
-                    if cidr.contains(addr) {
-                        let udp_socket = UdpSocket::bind((*addr, *port)).await?;
-                        self.udp_sockets.push(udp_socket);
-                        peer.udp_sockets.insert((*addr, *port), &udp_socket);
-                        return Ok(&mut udp_socket);
+            if peer.udp_sockets.get_mut(&(*addr, *port)).is_none() {
+                // check if we are acting as an exit for this peer on this addr
+                let mut found = false;
+                for cidrs in self.exit_cidrs.get(peer_id) {
+                    for cidr in cidrs {
+                        if cidr.contains(addr) {
+                            let udp_socket = UdpSocket::bind((*addr, *port)).await?;
+                            peer.udp_sockets.insert((*addr, *port), udp_socket);
+                            found = true;
+                        }
                     }
                 }
+                if !found {
+                    return Err(Box::new(Error::NoMatchCidr));
+                }
             }
-            return Err(Box::new(Error::NoMatchCidr));
+            return Ok(peer.udp_sockets.get_mut(&(*addr, *port)).unwrap());
         }
         Err(Box::new(Error::UnknownPeer))
     }
@@ -227,10 +245,10 @@ impl Client {
     /// process a packet received on TUN device
     fn process_tun_packet(&mut self, packet: Packet, swarm: &mut Swarm<Behaviour>) -> Result<()> {
         if let Some(peer) = self.get_peer(packet.daddr()) {
-            swarm.behaviour_mut().request_response.send_request(
-                &peer,
-                packet,
-            );
+            swarm
+                .behaviour_mut()
+                .request_response
+                .send_request(&peer, PacketRequest::ToNet(packet));
             Ok(())
         } else {
             Err(Box::new(Error::NoPeerRegisteredForIpv4Addr))
@@ -238,115 +256,132 @@ impl Client {
     }
 
     // process a packet received from a peer on p2p transport
-    async fn process_peer_packet(&self, peer: &PeerId, packet: &Packet) -> Result<()> {
+    async fn process_peer_packet<T: AsyncWrite + Unpin>(
+        &mut self,
+        peer_id: &PeerId,
+        packet: &PacketRequest,
+        writer: &mut T,
+    ) -> Result<()> {
         match packet {
-            // outgoing packets are written to the appopriate socket
-            Packet::Out { transport, payload } => match transport {
-                Transport::Tcp { daddr, dport, .. } => {
-                    let tcp_stream = self.get_tcp_stream(peer, &daddr, &dport).await?;
-                    tcp_stream.send(payload).await
+            PacketRequest::ToNet(packet) => match packet.transport() {
+                Transport::Tcp {
+                    sport,
+                    dport,
+                    payload,
+                } => {
+                    let (tcp_stream, _seq_num) =
+                        self.get_tcp_stream(peer_id, packet.daddr(), &dport).await?;
+                    tcp_stream.write_all(payload).await?;
                 }
-                Transport::Udp { daddr, dport, .. } => {
-                    let udp_socket = self.get_udp_socket(peer, &daddr, &dport).await?;
+                Transport::Udp {
+                    sport,
+                    dport,
+                    payload,
+                } => {
+                    let udp_socket = self.get_udp_socket(peer_id, packet.daddr(), &dport).await?;
                     udp_socket
-                        .send_to(payload.as_slice(), (*daddr, *dport))
+                        .send_to(payload.as_slice(), (*packet.daddr(), *dport))
                         .await;
                 }
-                _ => return Err(Box::new(Error::UnsupportedProtocol)),
+                _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
             },
-            // incoming packets are written to the TUN if they
-            // they match the peer's incoming CIDRs
-            Packet::In { transport, payload } => {
-                let ip_packet = match transport {
-                    Transport::Tcp { .. } => {
-                        let ip_packet = Vec::<u8>::with_capacity(
-                            Ipv4Header::SERIALIZED_SIZE
-                                + TcpHeader::SERIALIZED_SIZE
-                                + payload.len(),
-                        );
-                        let ip_header = Ipv4Header::new(
-                            (TcpHeader::SERIALIZED_SIZE + payload.len()) as u16,
-                            20,
-                            IpNumber::Tcp,
-                            saddr.octets(),
-                            // TODO is this the right daddr?
-                            self.ipv4_addr.octets(),
-                        );
-                        ip_header.write(&mut ip_packet);
+            PacketRequest::ToTun(packet) => {
+                use etherparse::*;
+                let builder = PacketBuilder::ipv4(
+                    packet.saddr().octets(),
+                    // TODO is this the right daddr?
+                    self.ipv4_addr.octets(),
+                    20,
+                );
+                let ip_packet = match packet.transport() {
+                    Transport::Tcp {
+                        sport,
+                        dport,
+                        payload,
+                    } => {
+                        let peer = match self.peers.get(peer_id) {
+                            Some(peer) => peer,
+                            None => return Err(Box::new(Error::UnknownPeer)),
+                        };
+                        let (_tcp_stream, seq_num) =
+                            self.get_tcp_stream(peer_id, packet.saddr(), sport).await?;
+                        let builder = builder
+                            .tcp(*sport, *dport, *seq_num, 1)
+                            .options(&[])
+                            .unwrap();
+                        let mut ip_packet = Vec::<u8>::with_capacity(builder.size(payload.len()));
+                        builder.write(&mut ip_packet, payload).unwrap();
                         ip_packet
                     }
-                    Transport::Udp { .. } => {
-                        let ip_packet = Vec::<u8>::with_capacity(
-                            Ipv4Header::SERIALIZED_SIZE
-                                + UdpHeader::SERIALIZED_SIZE
-                                + payload.len(),
-                        );
-                        let ip_header = Ipv4Header::new(
-                            (UdpHeader::SERIALIZED_SIZE + payload.len()) as u16,
-                            20,
-                            IpNumber::Udp,
-                            saddr.octets(),
-                            self.ipv4_addr.octets(),
-                        );
-                        ip_header.write(&mut ip_packet);
+                    Transport::Udp {
+                        sport,
+                        dport,
+                        payload,
+                    } => {
+                        let builder = builder.udp(*sport, *dport);
+                        let mut ip_packet = Vec::<u8>::with_capacity(builder.size(payload.len()));
+                        builder.write(&mut ip_packet, payload).unwrap();
                         ip_packet
                     }
-                    _ => return Err(Box::new(Error::UnsupportedProtocol)),
+                    _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
                 };
-                let writer = self.tun.unwrap().writer();
-                writer.write(ip_packet).await;
+                writer.write(&ip_packet).await;
             }
         }
         Ok(())
     }
 
-    async fn process_tcp_streams(&self, swarm: &mut Swarm<Behaviour>) -> Result<()> {
-        for (peer_id, peer) in self.peers {
-            for ((saddr, sport), tcp_stream) in peer.tcp_streams {
+    async fn process_tcp_streams(&mut self, swarm: &mut Swarm<Behaviour>) -> Result<()> {
+        for (peer_id, peer) in &mut self.peers {
+            for ((saddr, sport), (tcp_stream, seq_num)) in &mut peer.tcp_streams {
                 let (daddr, dport) = match tcp_stream.peer_addr()? {
                     SocketAddr::V4(socket) => (*socket.ip(), socket.port()),
                     _ => return Err(Box::new(Error::UnsupportedInternetProtocol)),
                 };
-                let mut payload = [0u8; MTU];
-                tcp_stream.read(&mut payload).await;
+                let mut buf = [0u8; MTU];
+                let nbytes = tcp_stream.read(&mut buf).await?;
+                let mut payload = Vec::<u8>::with_capacity(nbytes);
+                payload.copy_from_slice(&buf);
                 swarm.behaviour_mut().request_response.send_request(
-                    peer_id,
-                    Packet::In {
+                    &peer_id,
+                    PacketRequest::ToNet(Packet {
+                        daddr,
+                        saddr: *saddr,
                         transport: Transport::Tcp {
-                            saddr,
-                            sport,
-                            daddr,
+                            sport: *sport,
                             dport,
+                            payload,
                         },
-                        payload,
-                    },
-                )
+                    }),
+                );
             }
         }
         Ok(())
     }
 
     async fn process_udp_streams(&self, swarm: &mut Swarm<Behaviour>) -> Result<()> {
-        for (peer_id, peer) in self.peers {
-            for ((saddr, sport), udp_socket) in peer.udp_sockets {
+        for (peer_id, peer) in &self.peers {
+            for ((saddr, sport), udp_socket) in &peer.udp_sockets {
                 let (daddr, dport) = match udp_socket.peer_addr()? {
                     SocketAddr::V4(socket) => (*socket.ip(), socket.port()),
                     _ => return Err(Box::new(Error::UnsupportedInternetProtocol)),
                 };
-                let mut payload = [0u8; MTU];
-                udp_socket.recv_from(&mut payload).await;
+                let mut buf = [0u8; MTU];
+                let (nbytes, socket_addr) = udp_socket.recv_from(&mut buf).await?;
+                let mut payload = Vec::<u8>::with_capacity(nbytes);
+                payload.copy_from_slice(&buf);
                 swarm.behaviour_mut().request_response.send_request(
-                    peer_id,
-                    Packet::In {
+                    &peer_id,
+                    PacketRequest::ToNet(Packet {
+                        daddr,
+                        saddr: *saddr,
                         transport: Transport::Udp {
-                            saddr,
-                            sport,
-                            daddr,
+                            sport: *sport,
                             dport,
+                            payload,
                         },
-                        payload,
-                    },
-                )
+                    }),
+                );
             }
         }
         Ok(())
@@ -369,19 +404,18 @@ impl Client {
 
         // create swarm
         let mut swarm = make_swarm(&self.keypair).await?;
-        let _listener_id = swarm.listen_on(self.listen)?;
+        let _listener_id = swarm.listen_on(self.listen.clone())?;
 
         // main loop
-        let mut peer_packet = [0u8; MTU];
         let (mut tun_reader, mut tun_writer) = tun.split();
         loop {
             select! {
-                packet = Packet::read_packet(&mut tun_reader) => {
+                packet = Packet::read_packet(&mut tun_reader).fuse() => {
                     let packet = packet?;
                     if let Some(peer) = self.get_peer(packet.daddr()) {
                         swarm.behaviour_mut().request_response.send_request(
                             &peer,
-                            packet,
+                            PacketRequest::ToNet(packet),
                         );
                     } else {
                         log::info!("no peer associated with addr")
@@ -392,7 +426,7 @@ impl Client {
                         peer,
                         message: RequestResponseMessage::Request { request, .. },
                     })) => {
-                        self.process_peer_packet(&peer, &request).await?;
+                        self.process_peer_packet(&peer, &request, &mut tun_writer).await?;
                     }
                     SwarmEvent::Behaviour(Event::Identify(IdentifyEvent::Received{ peer_id, info })) => {
                         let info: IdentifyInfo = info;
@@ -443,34 +477,6 @@ async fn make_swarm(id_keys: &Keypair) -> Result<Swarm<Behaviour>> {
             .add_address(&PeerId::from_str(peer)?, bootaddr.clone());
     }
     Ok(Swarm::new(transport, behaviour, peer_id))
-}
-
-#[allow(dead_code)]
-async fn race_udp_sockets() {
-    // https://stackoverflow.com/questions/63715918/how-to-race-a-collection-of-futures-in-rust
-    // https://stackoverflow.com/questions/72820408/how-to-get-the-result-of-the-first-future-to-complete-in-a-collection-of-futures
-    // TODO benchmark futures::stream::FuturesUnordered vs futures::future::select_all
-    use std::pin::Pin;
-    type IoError = std::io::Error;
-    type VecFuture = Vec<Pin<Box<dyn Future<Output = IoResult<PeerId>> + Send>>>;
-    let udp_sockets = HashMap::new();
-    udp_sockets.insert(
-        PeerId::random(),
-        (
-            UdpSocket::bind("10.0.1.12:8080").await.unwrap(),
-            [0u8; 1420],
-        ),
-    );
-    let mut incoming_udp_tasks = udp_sockets.into_iter().map(|(peer_id, (socket, buf))| {
-        socket
-            .recv_from(&mut buf)
-            .and_then(|nbytes| async move { Ok(peer_id) })
-            .boxed()
-    });
-    let (output, index, remaining_tasks): (IoResult<PeerId>, usize, VecFuture) =
-        select_all(incoming_udp_tasks).await;
-    let peer_id: PeerId = output?;
-    let (socket, buffer) = udp_sockets.get(&peer_id).unwrap();
 }
 
 #[cfg(test)]

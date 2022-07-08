@@ -1,9 +1,12 @@
-use crate::{Behaviour, Event, Packet, PacketRequest, Port, Result, Transport, MTU};
-use async_std::net::{SocketAddr, TcpStream, UdpSocket};
-use async_tun::TunBuilder;
+use crate::{Behaviour, Destination, Event, PacketRequest, Port, Result, MTU};
+use async_std::{
+    fs::File,
+    io::{BufReader, BufWriter},
+};
+use async_tun::{Tun, TunBuilder};
 // use bimap::BiMap;
 use cidr::Ipv4Cidr;
-use futures::{prelude::*, select};
+use futures::io::{Sink};
 use libp2p::{
     development_transport,
     identify::{IdentifyEvent, IdentifyInfo},
@@ -12,8 +15,27 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
+use pnet::{
+    packet::{
+        ip::IpNextHeaderProtocols,
+        ipv4::{Ipv4Packet, MutableIpv4Packet},
+        tcp::{MutableTcpPacket, TcpPacket},
+        udp::{MutableUdpPacket, UdpPacket},
+        MutablePacket, Packet,
+    },
+    transport::{
+        transport_channel, TransportChannelType::Layer3, TransportReceiver, TransportSender,
+        tcp_packet_iter,
+    },
+};
 
-use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    str::FromStr,
+    sync::{Arc,Mutex},
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -23,10 +45,16 @@ pub enum Error {
     UnsupportedTransportProtocol,
     UnknownPeer,
     NoMatchCidr,
+    InvalidIpPacket,
+    InvalidTcpPacket,
+    InvalidUdpPacket,
+    NoMatchingSocket,
+    NoMatchingPort,
 }
 
 impl std::error::Error for Error {}
 
+//TODO
 impl std::fmt::Display for Error {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -38,9 +66,25 @@ impl std::fmt::Display for Error {
 }
 
 struct Peer {
-    /// stores open streams and seq number
-    tcp_streams: HashMap<(Ipv4Addr, Port), (TcpStream, u32)>,
-    udp_sockets: HashMap<(Ipv4Addr, Port), UdpSocket>,
+    id: PeerId,
+    /// tcp ports on local machine for rewriting packets sent to network
+    exit_tcp_ports: HashMap<(Ipv4Addr, Port), Port>,
+    /// incoming TUN packets matching any CIDR will be sent to the
+    /// associated peer
+    forward_cidrs: Vec<Ipv4Cidr>,
+    /// packets received on p2p transport will be
+    /// sent to the network if they match any of the
+    /// associated CIDRs
+    exit_cidrs: Vec<Ipv4Cidr>,
+}
+
+impl Peer {
+    fn get_exit_tcp_port(&self, svc_addr: &Ipv4Addr, svc_port: &Port) -> Result<&Port> {
+        match self.exit_tcp_ports.get(&(*svc_addr, *svc_port)) {
+            Some(socket) => Ok(socket),
+            None => Err(Box::new(Error::NoMatchingPort)),
+        }
+    }
 }
 
 //TODO check for conflicting forward CIDRs between peers
@@ -53,16 +97,28 @@ pub struct Client {
     /// packets sent from the network through an exit
     /// to this peer will be given this ipv4 source address
     ipv4_addr: Ipv4Addr,
-    /// incoming TUN packets matching any CIDR will be sent to the
-    /// associated peer
-    forward_cidrs: HashMap<PeerId, Vec<Ipv4Cidr>>,
+    /// ipv4 address of the client on the local network
+    network_ipv4_addr: Ipv4Addr,
+    /// sender for network device that client will send tcp packets to
+    /// when acting as an exit
+    tcp_tx: Mutex<TransportSender>,
+    /// receiver for network device that client will receive packets from
+    /// when acting as an exit
+    tcp_rx: Mutex<TransportReceiver>,
     /// peers known to be associated with a given ipv4 forward addr
     cached_ipv4_peer: HashMap<Ipv4Addr, PeerId>,
-    /// packets received on p2p transport matching will be
-    /// sent to the network if they match any of the
-    /// associated CIDRs
-    exit_cidrs: HashMap<PeerId, Vec<Ipv4Cidr>>,
+    /// peers and daddrs we know we are acting as an exit for
+    cached_should_exit: HashSet<(PeerId, Ipv4Addr)>,
+    /// user that client will run as after creating
+    /// network device file handles
     user: users::User,
+    /// socket addresses associated with remote tcp service
+    local_tcp_sockets: HashMap<(Ipv4Addr, Port), (Ipv4Addr, Port)>,
+    tun: Tun,
+    // writer for TUN device
+    //tun_tx: BufWriter<&'a File>,
+    // reader for TUN device
+    //tun_rx: BufReader<&'a File>,
 }
 
 struct ClientBuilder {
@@ -114,11 +170,29 @@ impl ClientBuilder {
         }
     }
 
-    pub fn build<'a>(self) -> Option<Client> {
+    pub async fn build(self) -> Option<Client> {
         let keypair = self.keypair?;
         let listen = self.listen?;
         let user = users::get_user_by_name(&self.user?)?;
         let ipv4_addr = self.ipv4_addr?;
+        // create TUN device
+        let tun = match TunBuilder::new()
+            .name("")
+            .tap(false)
+            .packet_info(false)
+            .up()
+            .mtu(MTU as i32)
+            .try_build()
+            .await
+        {
+            Ok(tun) => tun,
+            Err(e) => return None,
+        };
+        let network_ipv4_addr: Ipv4Addr = {
+            // TODO get ipv4 address from tcp channel
+            "127.0.0.1".parse().unwrap()
+        };
+        let (mut tun_rx, mut tun_tx) = tun.split();
         Some(Client {
             listen,
             peer_id: keypair.public().to_peer_id(),
@@ -127,8 +201,10 @@ impl ClientBuilder {
             ipv4_addr,
             peers: HashMap::new(),
             cached_ipv4_peer: HashMap::new(),
-            exit_cidrs: HashMap::new(),
-            forward_cidrs: HashMap::new(),
+            cached_should_exit: HashSet::new(),
+            local_tcp_sockets: HashMap::new(),
+            tun,
+            network_ipv4_addr,
         })
     }
 }
@@ -146,259 +222,205 @@ impl Client {
     pub fn add_peer(
         &mut self,
         peer_id: PeerId,
-        forward_cidr: Vec<Ipv4Cidr>,
-        exit_cidr: Vec<Ipv4Cidr>,
+        forward_cidrs: Vec<Ipv4Cidr>,
+        exit_cidrs: Vec<Ipv4Cidr>,
     ) {
         self.peers.insert(
             peer_id,
             Peer {
-                tcp_streams: HashMap::new(),
-                udp_sockets: HashMap::new(),
+                id: peer_id,
+                exit_tcp_ports: HashMap::new(),
+                forward_cidrs,
+                exit_cidrs,
             },
         );
     }
 
-    /// return the open tcp stream associated with this
-    /// peer, dst addr, and dst port, creating one if
-    /// it does not exit
-    async fn get_tcp_stream(
-        &mut self,
-        peer_id: &PeerId,
-        dst_addr: &Ipv4Addr,
-        dst_port: &Port,
-    ) -> Result<&mut (TcpStream, u32)> {
-        // TODO maybe macro?
-        if let Some(peer) = self.peers.get_mut(peer_id) {
-            // check if we already opened a tcp stream for this peer, addr, port
-            if peer.tcp_streams.get_mut(&(*dst_addr, *dst_port)).is_none() {
-                // check if we are acting as an exit for this peer on this addr
-                let mut found = false;
-                for cidrs in self.exit_cidrs.get(peer_id) {
-                    for cidr in cidrs {
-                        if cidr.contains(dst_addr) {
-                            let tcp_stream = TcpStream::connect((*dst_addr, *dst_port)).await?;
-                            peer.tcp_streams
-                                .insert((*dst_addr, *dst_port), (tcp_stream, 0));
-                            found = true;
-                        }
-                    }
-                }
-                if !found {
-                    return Err(Box::new(Error::NoMatchCidr));
-                }
-            }
-            return Ok(peer.tcp_streams.get_mut(&(*dst_addr, *dst_port)).unwrap());
+    fn get_local_tcp_socket(
+        &self,
+        svc_addr: &Ipv4Addr,
+        svc_port: &Port,
+    ) -> Result<&(Ipv4Addr, Port)> {
+        match self.local_tcp_sockets.get(&(*svc_addr, *svc_port)) {
+            Some(socket) => Ok(socket),
+            None => Err(Box::new(Error::NoMatchingSocket)),
         }
-        Err(Box::new(Error::UnknownPeer))
     }
 
-    /// return the open udp socket associated with this
-    /// peer, listen addr, and listen port, creating one if
-    /// it does not exit
-    async fn get_udp_socket(
-        &mut self,
-        peer_id: &PeerId,
-        addr: &Ipv4Addr,
-        port: &Port,
-    ) -> Result<&mut UdpSocket> {
-        if let Some(peer) = self.peers.get_mut(peer_id) {
-            // check if we already opened a tcp stream for this peer, addr, port
-            if peer.udp_sockets.get_mut(&(*addr, *port)).is_none() {
-                // check if we are acting as an exit for this peer on this addr
-                let mut found = false;
-                for cidrs in self.exit_cidrs.get(peer_id) {
-                    for cidr in cidrs {
-                        if cidr.contains(addr) {
-                            let udp_socket = UdpSocket::bind((*addr, *port)).await?;
-                            peer.udp_sockets.insert((*addr, *port), udp_socket);
-                            found = true;
-                        }
-                    }
-                }
-                if !found {
-                    return Err(Box::new(Error::NoMatchCidr));
-                }
-            }
-            return Ok(peer.udp_sockets.get_mut(&(*addr, *port)).unwrap());
-        }
-        Err(Box::new(Error::UnknownPeer))
-    }
-
-    /// get the peer with a CIDR that matches the given
-    /// destination IP address
-    pub fn get_peer(&self, dst_addr: &Ipv4Addr) -> Option<PeerId> {
+    /// get the peer id associated with this ipv4 address.
+    /// Returns none if no peer has a CIDR that matches
+    /// the address
+    fn get_ipv4_peer(&mut self, daddr: &Ipv4Addr) -> Option<&PeerId> {
         // check if we've cached this ip addr
-        if let Some(peer) = self.cached_ipv4_peer.get(dst_addr) {
-            return Some(*peer);
+        if let Some(peer_id) = self.cached_ipv4_peer.get(daddr) {
+            return Some(peer_id);
         }
         // otherwise look for cidr match
-        for (peer, cidrs) in self.forward_cidrs {
-            for cidr in cidrs {
-                if cidr.contains(dst_addr) {
-                    return Some(peer);
+        for (peer_id, peer) in &mut self.peers {
+            let mut found = false;
+            for cidrs in peer.forward_cidrs {
+                for cidr in cidrs {
+                    if cidr.contains(daddr) {
+                        self.cached_ipv4_peer.insert(*daddr, *peer_id);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found {
+                return Some(peer_id);
+            }
+        }
+        return None;
+    }
+
+    /// determine whether we act as an exit for packets
+    /// originating from the given peer and destined
+    /// for the given address
+    fn should_exit(&self, peer_id: &PeerId, dst_addr: &Ipv4Addr) -> bool {
+        // check if we've cached this ip addr
+        if self.cached_should_exit.contains(&(*peer_id, *dst_addr)) {
+            return true;
+        }
+        // otherwise look for cidr match
+        if let Some(peer) = self.peers.get(peer_id) {
+            for cidrs in peer.forward_cidrs {
+                for cidr in cidrs {
+                    if cidr.contains(dst_addr) {
+                        self.cached_should_exit.insert((*peer_id, *dst_addr));
+                        return true;
+                    }
                 }
             }
         }
-        None
+        return false;
     }
 
-    /// process a packet received on TUN device
-    fn process_tun_packet(&mut self, packet: Packet, swarm: &mut Swarm<Behaviour>) -> Result<()> {
-        if let Some(peer) = self.get_peer(packet.daddr()) {
-            swarm
-                .behaviour_mut()
-                .request_response
-                .send_request(&peer, PacketRequest::ToNet(packet));
-            Ok(())
-        } else {
-            Err(Box::new(Error::NoPeerRegisteredForIpv4Addr))
+    /// handle a packet destined for the network
+    fn handle_network_packet<'b>(
+        &self,
+        peer_id: &PeerId,
+        packet: &mut [u8],
+        tcp_tx: TransportSender,
+    ) -> Result<()> {
+        let ipv4_packet = match MutableIpv4Packet::new(packet) {
+            Some(p) => p,
+            None => return Err(Box::new(Error::InvalidIpPacket))
+        };
+        let daddr = ipv4_packet.get_destination();
+        if !self.should_exit(&peer_id, &daddr) {
+            return Err(Box::new(Error::NoMatchCidr));
         }
+        ipv4_packet.set_source(self.network_ipv4_addr);
+        match ipv4_packet.get_next_level_protocol() {
+            Tcp => {
+                let mut tcp_packet = match MutableTcpPacket::new(ipv4_packet.payload_mut()) {
+                    Some(p) => p,
+                    None => return Err(Box::new(Error::InvalidTcpPacket)),
+                };
+                let dport = tcp_packet.get_destination();
+                let peer = self.peers.get(&peer_id).unwrap();
+                let sport = peer.get_exit_tcp_port(&daddr, &dport)?;
+                tcp_packet.set_source(*sport);
+                tcp_tx.send_to(ipv4_packet, IpAddr::V4(daddr));
+            }
+            _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
+        }
+        Ok(())
+    }
+
+    /// handle a packet destined for the local TUN
+    async fn handle_tun_packet<'b>(
+        &mut self,
+        peer_id: &PeerId,
+        packet: &mut [u8],
+    ) -> Result<()> {
+        use pnet::packet::ip::IpNextHeaderProtocols::{Tcp, Udp};
+        let mut ipv4_packet = match MutableIpv4Packet::new(packet) {
+            Some(p) => p,
+            None => return Err(Box::new(Error::InvalidIpPacket))
+        };
+        // source address of the remote service
+        let saddr = ipv4_packet.get_source();
+        let daddr = match ipv4_packet.get_next_level_protocol() {
+            Tcp => {
+                let mut tcp_packet = match MutableTcpPacket::new(ipv4_packet.payload_mut()) {
+                    Some(p) => p,
+                    None => return Err(Box::new(Error::InvalidTcpPacket)),
+                };
+                // source port of the remote service socket
+                let sport = tcp_packet.get_source();
+                let (daddr, dport) = self.get_local_tcp_socket(&saddr, &sport)?;
+                tcp_packet.set_destination(*dport);
+                daddr
+            }
+            _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
+        };
+        ipv4_packet.set_destination(*daddr);
+        use futures::{io::AsyncWriteExt};
+        self.tun.writer().write(&ipv4_packet.packet()).await;
+        Ok(())
     }
 
     // process a packet received from a peer on p2p transport
-    async fn process_peer_packet<T: AsyncWrite + Unpin>(
+    async fn process_peer_packet(
         &mut self,
         peer_id: &PeerId,
-        packet: &PacketRequest,
-        writer: &mut T,
+        mut request: PacketRequest,
     ) -> Result<()> {
-        match packet {
-            PacketRequest::ToNet(packet) => match packet.transport() {
-                Transport::Tcp {
-                    sport,
-                    dport,
-                    payload,
-                } => {
-                    let (tcp_stream, _seq_num) =
-                        self.get_tcp_stream(peer_id, packet.daddr(), &dport).await?;
-                    tcp_stream.write_all(payload).await?;
-                }
-                Transport::Udp {
-                    sport,
-                    dport,
-                    payload,
-                } => {
-                    let udp_socket = self.get_udp_socket(peer_id, packet.daddr(), &dport).await?;
-                    udp_socket
-                        .send_to(payload.as_slice(), (*packet.daddr(), *dport))
-                        .await;
-                }
-                _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
+        match request.destination() {
+            Destination::Net => {
+                let tcp_tx_mxg = self.tcp_tx.lock().unwrap();
+                let tcp_tx = *tcp_tx_mxg;
+                self.handle_network_packet(&peer_id, request.payload_mut(), tcp_tx)
             },
-            PacketRequest::ToTun(packet) => {
-                use etherparse::*;
-                let builder = PacketBuilder::ipv4(
-                    packet.saddr().octets(),
-                    // TODO is this the right daddr?
-                    self.ipv4_addr.octets(),
-                    20,
-                );
-                let ip_packet = match packet.transport() {
-                    Transport::Tcp {
-                        sport,
-                        dport,
-                        payload,
-                    } => {
-                        let peer = match self.peers.get(peer_id) {
-                            Some(peer) => peer,
-                            None => return Err(Box::new(Error::UnknownPeer)),
-                        };
-                        let (_tcp_stream, seq_num) =
-                            self.get_tcp_stream(peer_id, packet.saddr(), sport).await?;
-                        let builder = builder
-                            .tcp(*sport, *dport, *seq_num, 1)
-                            .options(&[])
-                            .unwrap();
-                        let mut ip_packet = Vec::<u8>::with_capacity(builder.size(payload.len()));
-                        builder.write(&mut ip_packet, payload).unwrap();
-                        ip_packet
-                    }
-                    Transport::Udp {
-                        sport,
-                        dport,
-                        payload,
-                    } => {
-                        let builder = builder.udp(*sport, *dport);
-                        let mut ip_packet = Vec::<u8>::with_capacity(builder.size(payload.len()));
-                        builder.write(&mut ip_packet, payload).unwrap();
-                        ip_packet
-                    }
-                    _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
-                };
-                writer.write(&ip_packet).await;
-            }
+            Destination::Tun => self.handle_tun_packet(&peer_id, request.payload_mut()).await,
         }
-        Ok(())
     }
 
-    async fn process_tcp_streams(&mut self, swarm: &mut Swarm<Behaviour>) -> Result<()> {
-        for (peer_id, peer) in &mut self.peers {
-            for ((saddr, sport), (tcp_stream, seq_num)) in &mut peer.tcp_streams {
-                let (daddr, dport) = match tcp_stream.peer_addr()? {
-                    SocketAddr::V4(socket) => (*socket.ip(), socket.port()),
-                    _ => return Err(Box::new(Error::UnsupportedInternetProtocol)),
+    /// process a packet received on TUN device
+    fn process_tun_packet(&mut self, packet: Vec<u8>, swarm: &mut Swarm<Behaviour>) -> Result<()> {
+        use pnet::packet::ip::IpNextHeaderProtocols::{Tcp, Udp};
+        let ipv4_packet = match Ipv4Packet::new(&packet) {
+            Some(p) => p,
+            None => return Err(Box::new(Error::InvalidIpPacket)),
+        };
+        // address of remote service socket
+        let daddr = ipv4_packet.get_destination();
+        let peer_id: &PeerId = match self.get_ipv4_peer(&daddr) {
+            Some(peer_id) => peer_id,
+            None => return Err(Box::new(Error::NoMatchCidr)),
+        };
+        // address of local socket
+        let saddr = ipv4_packet.get_source();
+        match ipv4_packet.get_next_level_protocol() {
+            Tcp => {
+                let tcp_packet = match TcpPacket::new(&mut ipv4_packet.payload()) {
+                    Some(p) => p,
+                    None => return Err(Box::new(Error::InvalidTcpPacket)),
                 };
-                let mut buf = [0u8; MTU];
-                let nbytes = tcp_stream.read(&mut buf).await?;
-                let mut payload = Vec::<u8>::with_capacity(nbytes);
-                payload.copy_from_slice(&buf);
-                swarm.behaviour_mut().request_response.send_request(
-                    &peer_id,
-                    PacketRequest::ToNet(Packet {
-                        daddr,
-                        saddr: *saddr,
-                        transport: Transport::Tcp {
-                            sport: *sport,
-                            dport,
-                            payload,
-                        },
-                    }),
-                );
+                // port of local socket
+                let sport = tcp_packet.get_source();
+                // port of remote service socket
+                let dport = tcp_packet.get_destination();
+                // TODO this runs for every packet; needs benchmark
+                self.local_tcp_sockets
+                    .insert((daddr, dport), (saddr, sport));
             }
+            _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
         }
-        Ok(())
-    }
-
-    async fn process_udp_streams(&self, swarm: &mut Swarm<Behaviour>) -> Result<()> {
-        for (peer_id, peer) in &self.peers {
-            for ((saddr, sport), udp_socket) in &peer.udp_sockets {
-                let (daddr, dport) = match udp_socket.peer_addr()? {
-                    SocketAddr::V4(socket) => (*socket.ip(), socket.port()),
-                    _ => return Err(Box::new(Error::UnsupportedInternetProtocol)),
-                };
-                let mut buf = [0u8; MTU];
-                let (nbytes, socket_addr) = udp_socket.recv_from(&mut buf).await?;
-                let mut payload = Vec::<u8>::with_capacity(nbytes);
-                payload.copy_from_slice(&buf);
-                swarm.behaviour_mut().request_response.send_request(
-                    &peer_id,
-                    PacketRequest::ToNet(Packet {
-                        daddr,
-                        saddr: *saddr,
-                        transport: Transport::Udp {
-                            sport: *sport,
-                            dport,
-                            payload,
-                        },
-                    }),
-                );
-            }
-        }
+        swarm.behaviour_mut().request_response.send_request(
+            &peer_id,
+            PacketRequest {
+                payload: ipv4_packet.packet().to_vec(),
+                destination: Destination::Net,
+            },
+        );
         Ok(())
     }
 
     /// Create p2p swarm and run client.
     pub async fn run(&mut self) -> Result<()> {
-        // create TUN device
-        let tun = TunBuilder::new()
-            .name("")
-            .tap(false)
-            .packet_info(false)
-            .up()
-            .mtu(MTU as i32)
-            .try_build()
-            .await?;
-
         // drop root privileges
         users::switch::set_effective_uid(self.user.uid())?;
 
@@ -406,27 +428,47 @@ impl Client {
         let mut swarm = make_swarm(&self.keypair).await?;
         let _listener_id = swarm.listen_on(self.listen.clone())?;
 
-        // main loop
-        let (mut tun_reader, mut tun_writer) = tun.split();
-        loop {
-            select! {
-                packet = Packet::read_packet(&mut tun_reader).fuse() => {
-                    let packet = packet?;
-                    if let Some(peer) = self.get_peer(packet.daddr()) {
-                        swarm.behaviour_mut().request_response.send_request(
-                            &peer,
-                            PacketRequest::ToNet(packet),
-                        );
-                    } else {
-                        log::info!("no peer associated with addr")
+        // TODO use threads until pnet supports async
+        let (mut tcp_packet_tx, mut tcp_packet_rx) = std::sync::mpsc::channel::<TcpPacket>();
+        let tcp_packet_tx_mutex = Mutex::new(tcp_packet_tx);
+        let (mut tcp_tx, mut tcp_rx) = match transport_channel(1500, Layer3(IpNextHeaderProtocols::Tcp)) {
+            Ok(t) => t,
+            Err(e) => return Err(Box::new(e)),
+        };
+        std::thread::spawn(move || {
+            let tcp_packet_tx_mx_guard = tcp_packet_tx_mutex.lock().unwrap();
+            let tcp_packet_tx = *tcp_packet_tx_mx_guard;
+            let iter = tcp_packet_iter(&mut tcp_rx);
+            loop {
+                match iter.next() {
+                    Ok((packet, addr)) => {
+                        tcp_packet_tx.send(packet);
+                    },
+                    Err(e) => {
+                        log::error!("failed to receive on tcp transport")
                     }
+                }
+            }
+        });
+
+        // main loop
+        let mut buf = [0u8; MTU];
+        let mut tun_reader = self.tun.reader();
+        loop {
+            use futures::{select, prelude::*};
+            select! {
+                nbytes = tun_reader.read(&mut buf).fuse() => {
+                    let nbytes: usize = nbytes?;
+                    let mut packet = Vec::<u8>::with_capacity(nbytes);
+                    packet.copy_from_slice(&buf);
+                    self.process_tun_packet(packet, &mut swarm);
                 }
                 e = swarm.select_next_some() => match e {
                     SwarmEvent::Behaviour(Event::RequestResponse(RequestResponseEvent::Message {
                         peer,
                         message: RequestResponseMessage::Request { request, .. },
                     })) => {
-                        self.process_peer_packet(&peer, &request, &mut tun_writer).await?;
+                        self.process_peer_packet(&peer, request).await?;
                     }
                     SwarmEvent::Behaviour(Event::Identify(IdentifyEvent::Received{ peer_id, info })) => {
                         let info: IdentifyInfo = info;

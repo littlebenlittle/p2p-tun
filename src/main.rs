@@ -14,7 +14,7 @@ use behaviour::{Behaviour, Event};
 use client::Client;
 use config::Config;
 use packet::{Packet, MTU, Port, Transport};
-use request_response::{PacketStreamCodec, PacketStreamProtocol, PacketRequest};
+use request_response::{PacketStreamCodec, Destination, PacketStreamProtocol, PacketRequest};
 
 use bimap::BiMap;
 use clap::{Parser, Subcommand};

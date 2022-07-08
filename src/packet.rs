@@ -1,184 +1,113 @@
 use crate::Result;
 use futures::prelude::*;
-use std::{io, net::Ipv4Addr};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use etherparse::{InternetSlice, SlicedPacket, TransportSlice};
 
 // TODO actually calculate this
-/// maxiumum allowed payload length given the length of serialized headers
+/// maxiumum allowed payload length given the length of
+/// transmitted packet headers
 pub const MTU: usize = 1420;
 
 pub type Port = u16;
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Packet {
-    transport: Transport,
-    saddr: Ipv4Addr,
-    daddr: Ipv4Addr,
-}
+pub struct Ipv4Packet(Vec<u8>);
 
-impl Packet {
-    pub fn from_ip(packet: &[u8]) -> io::Result<Self> {
-        let sliced_packet = match SlicedPacket::from_ip(&packet) {
-            Ok(packet) => packet,
-            Err(e) => return Err(io::ErrorKind::InvalidData.into()),
-        };
-        let (saddr, daddr) = match sliced_packet.ip {
-            Some(InternetSlice::Ipv4(header, extensions)) => {
-                (header.source_addr(), header.destination_addr())
-            }
-            _ => return Err(io::ErrorKind::InvalidData.into()),
-        };
-        let mut payload = Vec::<u8>::with_capacity(sliced_packet.payload.len());
-        payload.copy_from_slice(sliced_packet.payload);
-        let transport = match sliced_packet.transport {
-            Some(TransportSlice::Tcp(headers)) => Transport::Tcp {
-                sport: headers.source_port(),
-                dport: headers.destination_port(),
-                payload,
-            },
-            Some(TransportSlice::Udp(headers)) => Transport::Udp {
-                sport: headers.source_port(),
-                dport: headers.destination_port(),
-                payload,
-            },
-            _ => return Err(io::ErrorKind::InvalidData.into()),
-        };
-        Ok(Self {
-            transport,
-            saddr,
-            daddr,
-        })
-    }
-
-    pub fn to_wire_format(&self) -> Vec<u8> {
-        let transport_data = self.transport().to_wire_format();
-        let mut data = Vec::<u8>::with_capacity(
-            4 + // saddr octets
-            4 + // daddr octets
-            transport_data.len(),
-        );
-        // copy src address
-        data[0..4].copy_from_slice(&self.saddr().octets());
-        // copy dst address
-        data[4..8].copy_from_slice(&self.daddr().octets());
-        // copy transport headers
-        data[8..transport_data.len()].copy_from_slice(&transport_data);
-        // copy payload
-        data[8 + transport_data.len()..].copy_from_slice(&self.transport.payload());
-        data
-    }
-
-    pub fn from_wire_format(data: &[u8]) -> io::Result<Self> {
-        let saddr = Ipv4Addr::new(data[0], data[1], data[2], data[3]);
-        let daddr = Ipv4Addr::new(data[4], data[5], data[6], data[7]);
-        let transport = Transport::from_wire_format(&data[8..])?;
-        Ok(Self {
-            saddr,
-            daddr,
-            transport,
-        })
-    }
-
-    pub async fn read_packet<T: AsyncRead + Unpin>(reader: &mut T) -> Result<Packet> {
-        let mut buf = [0u8; MTU];
-        let nbytes: usize = reader.read(&mut buf).await?;
-        match Packet::from_ip(&buf[..nbytes]) {
-            Ok(packet) => Ok(packet),
-            Err(e) => Err(Box::new(e)),
+impl Ipv4Packet {
+    pub fn protocol(&self) -> Option<Protocol> {
+        match &self.0[9] {
+            0x01 => Some(Protocol::Icmp),
+            0x06 => Some(Protocol::Tcp),
+            0x11 => Some(Protocol::Udp),
+            _ => None,
         }
     }
 
-    pub fn saddr(&self) -> &Ipv4Addr {
-        &self.saddr
+    pub fn source_address(&self) -> Ipv4Addr {
+        Ipv4Addr::new(self.0[12], self.0[13], self.0[14], self.0[15])
     }
 
-    pub fn daddr(&self) -> &Ipv4Addr {
-        &self.daddr
+    pub fn destination_address(&self) -> Ipv4Addr {
+        Ipv4Addr::new(self.0[16], self.0[17], self.0[18], self.0[19])
     }
 
-    pub fn transport(&self) -> &Transport {
-        &self.transport
+    pub fn set_source_address(&mut self, addr: &Ipv4Addr) {
+        let octets = addr.octets();
+        for i in 0..4 {
+            self.0[12 + i] = octets[i];
+        }
+    }
+
+    pub fn set_destination_address(&mut self, addr: &Ipv4Addr) {
+        let octets = addr.octets();
+        for i in 0..4 {
+            self.0[16 + i] = octets[i];
+        }
+    }
+
+    pub fn compute_checksum(&mut self) {
+        let sum: u8 = self.0[0..5].iter().chain(self.0[6..9].iter()).sum();
+        self.0[5] = sum ^ 0o1;
+    }
+
+    pub fn payload(&self) -> Vec<u8> {
+        self.0[20..].to_vec()
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum Transport {
-    Tcp {
-        sport: Port,
-        dport: Port,
-        payload: Vec<u8>,
-    },
-    Udp {
-        sport: Port,
-        dport: Port,
-        payload: Vec<u8>,
-    },
+pub struct TcpPacket(Vec<u8>);
+
+impl TcpPacket {
+    pub fn source_port(&self) -> Port {
+        (self.0[0] << 8) as u16 | self.0[1] as u16
+    }
+
+    pub fn destination_port(&self) -> Port {
+        (self.0[2] << 8) as u16 | self.0[3] as u16
+    }
+
+    pub fn set_source_port(&self, port: Port) {
+        let port_bytes = port.to_be_bytes();
+        self.0[0] = port_bytes[0];
+        self.0[1] = port_bytes[1];
+    }
+
+    pub fn set_destination_port(&self, port: Port) {
+        let port_bytes = port.to_be_bytes();
+        self.0[2] = port_bytes[0];
+        self.0[3] = port_bytes[1];
+    }
+
+    pub fn compute_checksum(&mut self, src_addr: &Ipv4Addr, dst_addr: &Ipv4Addr) {
+        // pseudo header
+        let src_octets = src_addr.octets();
+        let dst_octets = dst_addr.octets();
+        let mut ph = [0u8; 12];
+        for i in 0..4 {
+            ph[0 + i] = src_octets[i];
+            ph[4 + i] = dst_octets[i];
+        }
+        ph[9] = 0x06; // protocol is tcp
+        let len_bytes = (self.0.len() as u16).to_be_bytes();
+        ph[10] = len_bytes[0];
+        ph[11] = len_bytes[1];
+        self.0[16] = ph.iter().sum();
+    }
 }
 
-impl Transport {
-    fn to_wire_format(&self) -> Vec<u8> {
-        match self {
-            Self::Tcp {
-                sport,
-                dport,
-                payload,
-            } => {
-                let mut data = Vec::<u8>::with_capacity(5 + payload.len());
-                data[0] = 0;
-                data[1] = (sport >> 8 & 0xff) as u8;
-                data[2] = (sport & 0xff) as u8;
-                data[3] = (dport >> 8 & 0xff) as u8;
-                data[4] = (dport & 0xff) as u8;
-                data[5..].copy_from_slice(&payload);
-                data
-            }
-            Self::Udp {
-                sport,
-                dport,
-                payload,
-            } => {
-                let mut data = Vec::<u8>::with_capacity(5 + payload.len());
-                data[0] = 1;
-                data[1] = ((sport >> 8) & 0xff) as u8;
-                data[2] = (sport & 0xff) as u8;
-                data[3] = ((dport >> 8) & 0xff) as u8;
-                data[4] = (dport & 0xff) as u8;
-                data[5..].copy_from_slice(&payload);
-                data
-            }
-        }
-    }
+pub enum IpVersion {
+    V4,
+    V6,
+}
 
-    fn from_wire_format(data: &[u8]) -> io::Result<Self> {
-        match data[0] {
-            0 => {
-                let payload = Vec::<u8>::with_capacity(data.len() - 11);
-                payload.copy_from_slice(&data[11..]);
-                Ok(Self::Tcp {
-                    sport: ((data[1] << 8) | data[2]) as u16,
-                    dport: ((data[3] << 8) | data[4]) as u16,
-                    payload,
-                })
-            }
-            0 => {
-                let payload = Vec::<u8>::with_capacity(data.len() - 4);
-                payload.copy_from_slice(&data[5..]);
-                Ok(Self::Udp {
-                    sport: ((data[1] << 8) | data[2]) as u16,
-                    dport: ((data[3] << 8) | data[4]) as u16,
-                    payload,
-                })
-            }
-            _ => Err(io::ErrorKind::InvalidData.into()),
-        }
-    }
-
-    fn payload(&self) -> &[u8] {
-        match self {
-            Self::Tcp { payload, .. } | Self::Udp { payload, .. } => payload,
-        }
-    }
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Icmp,
 }
 
 #[derive(Debug)]
@@ -202,90 +131,15 @@ impl std::fmt::Display for Error {
 #[cfg(test)]
 mod test {
     use super::*;
-    use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
-
-    impl Arbitrary for Transport {
-        fn arbitrary(g: &mut Gen) -> Transport {
-            *g.choose(&[
-                Transport::Tcp {
-                    sport: u16::arbitrary(g),
-                    dport: u16::arbitrary(g),
-                    payload: Vec::<u8>::arbitrary(g),
-                },
-                Transport::Udp {
-                    sport: u16::arbitrary(g),
-                    dport: u16::arbitrary(g),
-                    payload: Vec::<u8>::arbitrary(g),
-                },
-            ])
-            .unwrap()
-        }
-    }
-
-    impl Arbitrary for Packet {
-        fn arbitrary(g: &mut Gen) -> Packet {
-            Packet {
-                transport: Transport::arbitrary(g),
-                saddr: Ipv4Addr::arbitrary(g),
-                daddr: Ipv4Addr::arbitrary(g),
-            }
-        }
-    }
-
-    fn wire_format_encode_decode(packet: Packet) -> TestResult {
-        if packet.transport.payload().len() >= MTU {
-            return TestResult::discard();
-        }
-        TestResult::from_bool(packet == Packet::from_wire_format(&packet.to_wire_format()).unwrap())
+    // use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
+    
+    #[test]
+    fn ipv4_checksum() {
+        unimplemented!()
     }
 
     #[test]
-    fn quickcheck_test() {
-        quickcheck(wire_format_encode_decode as fn(Packet) -> TestResult)
+    fn tcp_checksum() {
+        unimplemented!()
     }
 }
-
-// TODO: add req/res to change MTU
-// Pub const PACKET_LEN: usize = 1500;
-//
-// #[derive(Debug, Clone)]
-// Pub struct Packet(pub [u8; PACKET_LEN]);
-//
-// Impl From<Packet> for Vec<u8> {
-//     fn from(packet: Packet) -> Vec<u8> {
-//         packet.0.into()
-//     }
-// }
-//
-// #[derive(Debug)]
-// Pub enum Error {
-//     Overflow,
-// }
-//
-// Impl std::fmt::Display for Error {
-//     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-//         match self {
-//             Error::Overflow => formatter.write_str("packet overflow"),
-//         }
-//     }
-// }
-//
-// Impl std::error::Error for Error {}
-//
-// Impl From<Error> for std::io::Error {
-//     fn from(e: Error) -> std::io::Error {
-//         std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}"))
-//     }
-// }
-//
-// Impl TryInto<Packet> for Vec<u8> {
-//     type Error = Error;
-//     fn try_into(self) -> Result<Packet, Self::Error> {
-//         if self.len() > PACKET_LEN {
-//             return Err(Error::Overflow);
-//         }
-//         let mut packet = [0u8; PACKET_LEN];
-//         packet[..self.len()].copy_from_slice(&self[..]);
-//         Ok(Packet(packet))
-//     }
-// }

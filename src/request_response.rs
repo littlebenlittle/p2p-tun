@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::core::upgrade::{read_length_prefixed, write_length_prefixed, ProtocolName};
 use libp2p::request_response::RequestResponseCodec;
-use std::convert::TryInto;
 
 use crate::{Packet, MTU};
 
@@ -17,11 +16,17 @@ impl ProtocolName for PacketStreamProtocol {
 }
 
 #[derive(Debug)]
-pub enum PacketRequest {
+pub struct PacketRequest {
+    payload: Vec<u8>,
+    destination: Destination,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Destination {
     // request to submit packet to network
-    ToNet(Packet),
+    Net,
     // request to submit packet to TUN device
-    ToTun(Packet),
+    Tun,
 }
 
 impl PacketRequest {
@@ -45,10 +50,16 @@ impl PacketRequest {
         }
     }
 
-    fn get_inner(&self) -> &Packet {
-        match self {
-            Self::ToNet(packet) | Self::ToTun(packet) => packet,
-        }
+    pub fn payload(&self) -> &[u8] {
+        return &self.payload
+    }
+
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        return &mut self.payload
+    }
+
+    pub fn destination(&self) -> &Destination {
+        return &self.destination
     }
 }
 

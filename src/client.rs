@@ -1,12 +1,10 @@
-use crate::{Behaviour, Destination, Event, PacketRequest, Port, Result, MTU};
-use async_std::{
-    fs::File,
-    io::{BufReader, BufWriter},
+use crate::{
+    Behaviour, Event, Ipv4Packet, PacketRequest, Port, Protocol::Tcp, Result, TcpPacket, MTU,
 };
 use async_tun::{Tun, TunBuilder};
 // use bimap::BiMap;
 use cidr::Ipv4Cidr;
-use futures::io::{Sink};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use libp2p::{
     development_transport,
     identify::{IdentifyEvent, IdentifyInfo},
@@ -15,27 +13,15 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
-use pnet::{
-    packet::{
-        ip::IpNextHeaderProtocols,
-        ipv4::{Ipv4Packet, MutableIpv4Packet},
-        tcp::{MutableTcpPacket, TcpPacket},
-        udp::{MutableUdpPacket, UdpPacket},
-        MutablePacket, Packet,
-    },
-    transport::{
-        transport_channel, TransportChannelType::Layer3, TransportReceiver, TransportSender,
-        tcp_packet_iter,
-    },
-};
 
 use std::{
     collections::{HashMap, HashSet},
-    io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::Ipv4Addr,
     str::FromStr,
-    sync::{Arc,Mutex},
+    sync::{Mutex, MutexGuard},
 };
+
+use self::network::Network;
 
 #[derive(Debug)]
 pub enum Error {
@@ -54,7 +40,7 @@ pub enum Error {
 
 impl std::error::Error for Error {}
 
-//TODO
+//TODO handle for each error type
 impl std::fmt::Display for Error {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -62,6 +48,15 @@ impl std::fmt::Display for Error {
                 fmt.write_str("no peer registered for ipv4 address")
             }
         }
+    }
+}
+
+fn into_boxed<T, E: std::error::Error + Sync + Send + 'static>(
+    result: std::result::Result<T, E>,
+) -> Result<T> {
+    match result {
+        Ok(t) => Ok(t),
+        Err(e) => Err(Box::new(e)),
     }
 }
 
@@ -88,7 +83,7 @@ impl Peer {
 }
 
 //TODO check for conflicting forward CIDRs between peers
-pub struct Client {
+pub struct Client<'a> {
     peer_id: PeerId,
     keypair: Keypair,
     /// client's p2p swarm listen address
@@ -99,12 +94,6 @@ pub struct Client {
     ipv4_addr: Ipv4Addr,
     /// ipv4 address of the client on the local network
     network_ipv4_addr: Ipv4Addr,
-    /// sender for network device that client will send tcp packets to
-    /// when acting as an exit
-    tcp_tx: Mutex<TransportSender>,
-    /// receiver for network device that client will receive packets from
-    /// when acting as an exit
-    tcp_rx: Mutex<TransportReceiver>,
     /// peers known to be associated with a given ipv4 forward addr
     cached_ipv4_peer: HashMap<Ipv4Addr, PeerId>,
     /// peers and daddrs we know we are acting as an exit for
@@ -114,21 +103,20 @@ pub struct Client {
     user: users::User,
     /// socket addresses associated with remote tcp service
     local_tcp_sockets: HashMap<(Ipv4Addr, Port), (Ipv4Addr, Port)>,
-    tun: Tun,
-    // writer for TUN device
-    //tun_tx: BufWriter<&'a File>,
-    // reader for TUN device
-    //tun_rx: BufReader<&'a File>,
+    tun: Mutex<Tun>,
+    net: Mutex<Network<'a>>,
 }
 
-struct ClientBuilder {
+struct ClientBuilder<'a> {
     keypair: Option<Keypair>,
     listen: Option<Multiaddr>,
     user: Option<String>,
     ipv4_addr: Option<Ipv4Addr>,
+    tun: Option<Tun>,
+    net: Option<Network<'a>>,
 }
 
-impl ClientBuilder {
+impl<'a> ClientBuilder<'a> {
     /// set the keypair of p2p swarm peer
     pub fn keypair(self, keypair: Keypair) -> Self {
         Self {
@@ -136,6 +124,8 @@ impl ClientBuilder {
             listen: self.listen,
             user: self.user,
             ipv4_addr: self.ipv4_addr,
+            tun: self.tun,
+            net: self.net,
         }
     }
 
@@ -146,6 +136,8 @@ impl ClientBuilder {
             keypair: self.keypair,
             user: self.user,
             ipv4_addr: self.ipv4_addr,
+            tun: self.tun,
+            net: self.net,
         }
     }
 
@@ -156,6 +148,8 @@ impl ClientBuilder {
             keypair: self.keypair,
             user: Some(user),
             ipv4_addr: self.ipv4_addr,
+            tun: self.tun,
+            net: self.net,
         }
     }
 
@@ -167,55 +161,40 @@ impl ClientBuilder {
             keypair: self.keypair,
             user: self.user,
             ipv4_addr: Some(ipv4_addr),
+            tun: self.tun,
+            net: self.net,
         }
     }
 
-    pub async fn build(self) -> Option<Client> {
+    pub async fn build(self) -> Option<Client<'a>> {
         let keypair = self.keypair?;
-        let listen = self.listen?;
-        let user = users::get_user_by_name(&self.user?)?;
-        let ipv4_addr = self.ipv4_addr?;
-        // create TUN device
-        let tun = match TunBuilder::new()
-            .name("")
-            .tap(false)
-            .packet_info(false)
-            .up()
-            .mtu(MTU as i32)
-            .try_build()
-            .await
-        {
-            Ok(tun) => tun,
-            Err(e) => return None,
-        };
-        let network_ipv4_addr: Ipv4Addr = {
-            // TODO get ipv4 address from tcp channel
-            "127.0.0.1".parse().unwrap()
-        };
-        let (mut tun_rx, mut tun_tx) = tun.split();
+        let net = self.net?;
         Some(Client {
-            listen,
+            listen: self.listen?,
+            network_ipv4_addr: *net.get_ipv4_addr(),
             peer_id: keypair.public().to_peer_id(),
             keypair,
-            user,
-            ipv4_addr,
+            user: users::get_user_by_name(&self.user?)?,
+            ipv4_addr: self.ipv4_addr?,
             peers: HashMap::new(),
             cached_ipv4_peer: HashMap::new(),
             cached_should_exit: HashSet::new(),
             local_tcp_sockets: HashMap::new(),
-            tun,
-            network_ipv4_addr,
+            tun: Mutex::new(self.tun?),
+            net: Mutex::new(net),
         })
     }
 }
 
-impl Client {
-    pub fn builder() -> ClientBuilder {
+impl<'a> Client<'a> {
+    pub fn builder() -> ClientBuilder<'a> {
         ClientBuilder {
             keypair: None,
             listen: None,
             user: None,
             ipv4_addr: None,
+            tun: None,
+            net: None,
         }
     }
 
@@ -250,10 +229,10 @@ impl Client {
     /// get the peer id associated with this ipv4 address.
     /// Returns none if no peer has a CIDR that matches
     /// the address
-    fn get_ipv4_peer(&mut self, daddr: &Ipv4Addr) -> Option<&PeerId> {
+    fn get_ipv4_peer(&mut self, daddr: &Ipv4Addr) -> Result<&PeerId> {
         // check if we've cached this ip addr
         if let Some(peer_id) = self.cached_ipv4_peer.get(daddr) {
-            return Some(peer_id);
+            return Ok(peer_id);
         }
         // otherwise look for cidr match
         for (peer_id, peer) in &mut self.peers {
@@ -268,10 +247,10 @@ impl Client {
                 }
             }
             if found {
-                return Some(peer_id);
+                return Ok(peer_id);
             }
         }
-        return None;
+        return Err(Box::new(Error::NoMatchCidr));
     }
 
     /// determine whether we act as an exit for packets
@@ -297,126 +276,129 @@ impl Client {
     }
 
     /// handle a packet destined for the network
-    fn handle_network_packet<'b>(
-        &self,
-        peer_id: &PeerId,
-        packet: &mut [u8],
-        tcp_tx: TransportSender,
-    ) -> Result<()> {
-        let ipv4_packet = match MutableIpv4Packet::new(packet) {
-            Some(p) => p,
-            None => return Err(Box::new(Error::InvalidIpPacket))
-        };
-        let daddr = ipv4_packet.get_destination();
+    async fn handle_net_packet(&self, peer_id: &PeerId, mut packet: Vec<u8>) -> Result<()> {
+        let mut ipv4_packet = Ipv4Packet::new(&mut packet)?;
+        let daddr = ipv4_packet.destination_address();
         if !self.should_exit(&peer_id, &daddr) {
             return Err(Box::new(Error::NoMatchCidr));
         }
-        ipv4_packet.set_source(self.network_ipv4_addr);
-        match ipv4_packet.get_next_level_protocol() {
+        let saddr = self.network_ipv4_addr;
+        ipv4_packet.set_source_address(&saddr);
+        match ipv4_packet.protocol()? {
             Tcp => {
-                let mut tcp_packet = match MutableTcpPacket::new(ipv4_packet.payload_mut()) {
-                    Some(p) => p,
-                    None => return Err(Box::new(Error::InvalidTcpPacket)),
-                };
-                let dport = tcp_packet.get_destination();
+                let mut tcp_packet = TcpPacket::new(ipv4_packet.payload())?;
+                let dport = tcp_packet.destination_port();
                 let peer = self.peers.get(&peer_id).unwrap();
                 let sport = peer.get_exit_tcp_port(&daddr, &dport)?;
-                tcp_packet.set_source(*sport);
-                tcp_tx.send_to(ipv4_packet, IpAddr::V4(daddr));
+                tcp_packet.set_source_port(sport);
+                tcp_packet.compute_checksum(&saddr, &daddr);
+                self.send_net(ipv4_packet.data()).await?;
             }
-            _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
+            _ => unimplemented!(),
         }
         Ok(())
     }
 
     /// handle a packet destined for the local TUN
-    async fn handle_tun_packet<'b>(
-        &mut self,
-        peer_id: &PeerId,
-        packet: &mut [u8],
-    ) -> Result<()> {
-        use pnet::packet::ip::IpNextHeaderProtocols::{Tcp, Udp};
-        let mut ipv4_packet = match MutableIpv4Packet::new(packet) {
-            Some(p) => p,
-            None => return Err(Box::new(Error::InvalidIpPacket))
-        };
+    async fn handle_tun_packet(&mut self, peer_id: &PeerId, mut packet: Vec<u8>) -> Result<()> {
+        let mut ipv4_packet = Ipv4Packet::new(&mut packet)?;
         // source address of the remote service
-        let saddr = ipv4_packet.get_source();
-        let daddr = match ipv4_packet.get_next_level_protocol() {
+        let saddr = ipv4_packet.source_address();
+        let daddr = match ipv4_packet.protocol()? {
             Tcp => {
-                let mut tcp_packet = match MutableTcpPacket::new(ipv4_packet.payload_mut()) {
-                    Some(p) => p,
-                    None => return Err(Box::new(Error::InvalidTcpPacket)),
-                };
-                // source port of the remote service socket
-                let sport = tcp_packet.get_source();
+                let mut tcp_packet = TcpPacket::new(ipv4_packet.payload())?;
+                let dport = tcp_packet.destination_port();
+                let peer = self.peers.get(&peer_id).unwrap();
+                let sport = tcp_packet.source_port();
                 let (daddr, dport) = self.get_local_tcp_socket(&saddr, &sport)?;
-                tcp_packet.set_destination(*dport);
+                tcp_packet.set_destination_port(dport);
+                tcp_packet.compute_checksum(&saddr, &daddr);
                 daddr
             }
-            _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
+            _ => unimplemented!(),
         };
-        ipv4_packet.set_destination(*daddr);
-        use futures::{io::AsyncWriteExt};
-        self.tun.writer().write(&ipv4_packet.packet()).await;
+        ipv4_packet.set_destination_address(daddr);
+        self.send_tun(ipv4_packet.data()).await?;
         Ok(())
-    }
-
-    // process a packet received from a peer on p2p transport
-    async fn process_peer_packet(
-        &mut self,
-        peer_id: &PeerId,
-        mut request: PacketRequest,
-    ) -> Result<()> {
-        match request.destination() {
-            Destination::Net => {
-                let tcp_tx_mxg = self.tcp_tx.lock().unwrap();
-                let tcp_tx = *tcp_tx_mxg;
-                self.handle_network_packet(&peer_id, request.payload_mut(), tcp_tx)
-            },
-            Destination::Tun => self.handle_tun_packet(&peer_id, request.payload_mut()).await,
-        }
     }
 
     /// process a packet received on TUN device
     fn process_tun_packet(&mut self, packet: Vec<u8>, swarm: &mut Swarm<Behaviour>) -> Result<()> {
-        use pnet::packet::ip::IpNextHeaderProtocols::{Tcp, Udp};
-        let ipv4_packet = match Ipv4Packet::new(&packet) {
-            Some(p) => p,
-            None => return Err(Box::new(Error::InvalidIpPacket)),
-        };
-        // address of remote service socket
-        let daddr = ipv4_packet.get_destination();
-        let peer_id: &PeerId = match self.get_ipv4_peer(&daddr) {
-            Some(peer_id) => peer_id,
-            None => return Err(Box::new(Error::NoMatchCidr)),
-        };
-        // address of local socket
-        let saddr = ipv4_packet.get_source();
-        match ipv4_packet.get_next_level_protocol() {
+        let mut ipv4_packet = Ipv4Packet::new(&mut packet)?;
+        let daddr = ipv4_packet.destination_address();
+        let peer_id: &PeerId = self.get_ipv4_peer(&daddr)?;
+        let saddr = ipv4_packet.source_address();
+        match ipv4_packet.protocol()? {
             Tcp => {
-                let tcp_packet = match TcpPacket::new(&mut ipv4_packet.payload()) {
-                    Some(p) => p,
-                    None => return Err(Box::new(Error::InvalidTcpPacket)),
-                };
-                // port of local socket
-                let sport = tcp_packet.get_source();
-                // port of remote service socket
-                let dport = tcp_packet.get_destination();
+                let tcp_packet = TcpPacket::new(&mut ipv4_packet.payload())?;
+                let sport = tcp_packet.source_port();
+                let dport = tcp_packet.destination_port();
                 // TODO this runs for every packet; needs benchmark
                 self.local_tcp_sockets
                     .insert((daddr, dport), (saddr, sport));
             }
-            _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
+            _ => unimplemented!(),
         }
-        swarm.behaviour_mut().request_response.send_request(
-            &peer_id,
-            PacketRequest {
-                payload: ipv4_packet.packet().to_vec(),
-                destination: Destination::Net,
-            },
-        );
+        swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(&peer_id, PacketRequest::Remote(packet));
         Ok(())
+    }
+
+    /// process a packet received from the network
+    fn process_net_packet(&mut self, packet: Vec<u8>, swarm: &mut Swarm<Behaviour>) -> Result<()> {
+        let ipv4_packet = Ipv4Packet::new(&mut packet)?;
+        let saddr = ipv4_packet.source_address();
+        let peer_id = match ipv4_packet.protocol()? {
+            Tcp => {
+                let tcp_packet = TcpPacket::new(ipv4_packet.payload())?;
+                let sport = tcp_packet.source_port();
+                let dport = tcp_packet.destination_port();
+                self.get_source_peer(&saddr, &sport, &dport)?
+            }
+            _ => return Err(Box::new(Error::UnsupportedTransportProtocol)),
+        };
+        swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(peer_id, PacketRequest::Local(packet));
+        Ok(())
+    }
+
+    /// get the source peer associated with given remote
+    /// socket address and local destination port
+    fn get_source_peer(
+        &self,
+        remote_addr: &Ipv4Addr,
+        remote_sport: &Port,
+        local_port: &Port,
+    ) -> Result<&PeerId> {
+        unimplemented!()
+    }
+
+    /// send a packet to the external network
+    async fn send_net(&self, data: Vec<u8>) -> Result<()> {
+        let mut fd: MutexGuard<Network> = self.net.lock().unwrap();
+        into_boxed(fd.write_all(&data).await)
+    }
+
+    /// send a packet to the tun device
+    async fn send_tun(&self, data: Vec<u8>) -> Result<()> {
+        let tun: MutexGuard<Tun> = self.tun.lock().unwrap();
+        into_boxed(tun.writer().write_all(&data).await)
+    }
+
+    /// get the next packet from the network
+    async fn next_net_packet(&mut self) -> Result<Vec<u8>> {
+        let mut fd: MutexGuard<Network> = self.net.lock().unwrap();
+        read_vec(&mut *fd).await
+    }
+
+    /// get the next packet from the tunnel
+    async fn next_tun_packet(&mut self) -> Result<Vec<u8>> {
+        let tun: MutexGuard<Tun> = self.tun.lock().unwrap();
+        read_vec(&mut tun.reader()).await
     }
 
     /// Create p2p swarm and run client.
@@ -428,47 +410,22 @@ impl Client {
         let mut swarm = make_swarm(&self.keypair).await?;
         let _listener_id = swarm.listen_on(self.listen.clone())?;
 
-        // TODO use threads until pnet supports async
-        let (mut tcp_packet_tx, mut tcp_packet_rx) = std::sync::mpsc::channel::<TcpPacket>();
-        let tcp_packet_tx_mutex = Mutex::new(tcp_packet_tx);
-        let (mut tcp_tx, mut tcp_rx) = match transport_channel(1500, Layer3(IpNextHeaderProtocols::Tcp)) {
-            Ok(t) => t,
-            Err(e) => return Err(Box::new(e)),
-        };
-        std::thread::spawn(move || {
-            let tcp_packet_tx_mx_guard = tcp_packet_tx_mutex.lock().unwrap();
-            let tcp_packet_tx = *tcp_packet_tx_mx_guard;
-            let iter = tcp_packet_iter(&mut tcp_rx);
-            loop {
-                match iter.next() {
-                    Ok((packet, addr)) => {
-                        tcp_packet_tx.send(packet);
-                    },
-                    Err(e) => {
-                        log::error!("failed to receive on tcp transport")
-                    }
-                }
-            }
-        });
-
         // main loop
-        let mut buf = [0u8; MTU];
-        let mut tun_reader = self.tun.reader();
         loop {
-            use futures::{select, prelude::*};
+            use futures::{prelude::*, select};
             select! {
-                nbytes = tun_reader.read(&mut buf).fuse() => {
-                    let nbytes: usize = nbytes?;
-                    let mut packet = Vec::<u8>::with_capacity(nbytes);
-                    packet.copy_from_slice(&buf);
-                    self.process_tun_packet(packet, &mut swarm);
-                }
-                e = swarm.select_next_some() => match e {
+                packet = self.next_tun_packet() => self.process_tun_packet(packet?, &mut swarm)?,
+                packet = self.next_net_packet() => self.process_net_packet(packet?, &mut swarm)?,
+                event = swarm.select_next_some() => match event {
                     SwarmEvent::Behaviour(Event::RequestResponse(RequestResponseEvent::Message {
                         peer,
                         message: RequestResponseMessage::Request { request, .. },
                     })) => {
-                        self.process_peer_packet(&peer, request).await?;
+                        use PacketRequest::{Local, Remote};
+                        match request {
+                            Remote(packet) => self.handle_net_packet(&peer, packet).await?,
+                            Local(packet) => self.handle_tun_packet(&peer, packet).await?,
+                        }
                     }
                     SwarmEvent::Behaviour(Event::Identify(IdentifyEvent::Received{ peer_id, info })) => {
                         let info: IdentifyInfo = info;
@@ -519,6 +476,99 @@ async fn make_swarm(id_keys: &Keypair) -> Result<Swarm<Behaviour>> {
             .add_address(&PeerId::from_str(peer)?, bootaddr.clone());
     }
     Ok(Swarm::new(transport, behaviour, peer_id))
+}
+
+async fn read_vec<T: AsyncRead + Unpin>(reader: &mut T) -> Result<Vec<u8>> {
+    let mut buf = [0u8; MTU];
+    let nbytes = reader.read(&mut buf).await?;
+    let mut data = Vec::<u8>::with_capacity(nbytes);
+    data.copy_from_slice(&buf);
+    Ok(data)
+}
+
+async fn create_tun() -> Result<Tun> {
+    TunBuilder::new()
+        .name("")
+        .tap(false)
+        .packet_info(false)
+        .up()
+        .mtu(MTU as i32)
+        .try_build()
+        .await
+}
+
+mod network {
+    use async_std::{fs::File, os::unix::io::FromRawFd};
+    use futures::{
+        io::{AsyncRead, AsyncWrite, Error},
+        task::{Context, Poll},
+    };
+    use std::{io, net::Ipv4Addr, pin::Pin};
+
+    /// an IP network device
+    pub struct Network<'a> {
+        fd: File,
+        pin: Pin<&'a mut File>,
+        ipv4_addr: Ipv4Addr,
+    }
+
+    impl<'a> Network<'a> {
+        /// create a new network device and resolve
+        /// its ipv4 address using ARP
+        pub fn new() -> io::Result<Self> {
+            // based on https://thomask.sdf.org/blog/2017/09/01/layer-2-raw-sockets-on-rustlinux.html
+            const ETH_P_IP: u16 = 0x0800;
+            use libc::{socket, AF_PACKET, SOCK_RAW};
+            let fd = unsafe {
+                match socket(AF_PACKET, SOCK_RAW, ETH_P_IP.to_be() as i32) {
+                    -1 => return Err(io::Error::last_os_error()),
+                    fd => File::from_raw_fd(fd)
+                }
+            };
+            let ipv4_addr: Ipv4Addr = {
+                //TODO do ARP request
+            };
+            Ok(Self {
+                pin: Pin::new(&mut fd),
+                fd,
+                ipv4_addr,
+            })
+        }
+
+        pub fn get_ipv4_addr(&self) -> &Ipv4Addr {
+            return &self.ipv4_addr
+        }
+    }
+
+    impl<'a> AsyncRead for Network<'a> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut futures::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> futures::task::Poll<core::result::Result<usize, Error>> {
+            // TODO strip layer 2 headers
+            self.pin.poll_read(cx, buf)
+        }
+    }
+
+    impl<'a> AsyncWrite for Network<'a> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<core::result::Result<usize, Error>> {
+            // TODO add layer 2 headers
+            self.pin.poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            self.pin.poll_flush(cx)
+        }
+
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+            self.pin.poll_close(cx)
+        }
+    }
 }
 
 #[cfg(test)]

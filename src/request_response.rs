@@ -16,9 +16,11 @@ impl ProtocolName for PacketStreamProtocol {
 }
 
 #[derive(Debug)]
-pub struct PacketRequest {
-    payload: Vec<u8>,
-    destination: Destination,
+pub enum PacketRequest {
+    /// data from a local peer destined for a remote service
+    Remote(Vec<u8>),
+    /// data from a remote service destined for the local peer
+    Local(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -27,40 +29,6 @@ pub enum Destination {
     Net,
     // request to submit packet to TUN device
     Tun,
-}
-
-impl PacketRequest {
-    pub fn to_wire_format(&self) -> Vec<u8> {
-        let inner_data = self.get_inner().to_wire_format();
-        let mut data = Vec::<u8>::with_capacity(1 + inner_data.len());
-        data[0] = match self {
-            Self::ToNet(_) => 0u8,
-            Self::ToTun(packet) => 1u8,
-        };
-        data[1..].copy_from_slice(&inner_data);
-        data
-    }
-
-    pub fn from_wire_format(data: &[u8]) -> io::Result<Self> {
-        let packet = Packet::from_wire_format(&data[1..])?;
-        match data[0] {
-            0 => Ok(Self::ToNet(packet)),
-            1 => Ok(Self::ToTun(packet)),
-            _ => Err(io::ErrorKind::InvalidData.into())
-        }
-    }
-
-    pub fn payload(&self) -> &[u8] {
-        return &self.payload
-    }
-
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        return &mut self.payload
-    }
-
-    pub fn destination(&self) -> &Destination {
-        return &self.destination
-    }
 }
 
 #[derive(Debug, Clone)]

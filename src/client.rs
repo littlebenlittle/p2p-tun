@@ -1,10 +1,8 @@
 use crate::{
-    Behaviour, Event, Ipv4Packet, PacketRequest, Port, Protocol::Tcp, Result, TcpPacket, MTU,
+    Behaviour, Event, Ipv4Packet, PacketRequest, Port, Protocol::Tcp, Result, TcpPacket, MTU, Network
 };
-use async_tun::{Tun, TunBuilder};
-// use bimap::BiMap;
 use cidr::Ipv4Cidr;
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use libp2p::{
     development_transport,
     identify::{IdentifyEvent, IdentifyInfo},
@@ -21,7 +19,6 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use self::network::Network;
 
 #[derive(Debug)]
 pub enum Error {
@@ -51,15 +48,6 @@ impl std::fmt::Display for Error {
     }
 }
 
-fn into_boxed<T, E: std::error::Error + Sync + Send + 'static>(
-    result: std::result::Result<T, E>,
-) -> Result<T> {
-    match result {
-        Ok(t) => Ok(t),
-        Err(e) => Err(Box::new(e)),
-    }
-}
-
 struct Peer {
     id: PeerId,
     /// tcp ports on local machine for rewriting packets sent to network
@@ -83,7 +71,7 @@ impl Peer {
 }
 
 //TODO check for conflicting forward CIDRs between peers
-pub struct Client<'a> {
+pub struct Client<'a, T: AsyncRead + AsyncWrite> {
     peer_id: PeerId,
     keypair: Keypair,
     /// client's p2p swarm listen address
@@ -103,20 +91,20 @@ pub struct Client<'a> {
     user: users::User,
     /// socket addresses associated with remote tcp service
     local_tcp_sockets: HashMap<(Ipv4Addr, Port), (Ipv4Addr, Port)>,
-    tun: Mutex<Tun>,
+    tun: Mutex<T>,
     net: Mutex<Network<'a>>,
 }
 
-struct ClientBuilder<'a> {
+struct ClientBuilder<'a, T: AsyncRead + AsyncWrite> {
     keypair: Option<Keypair>,
     listen: Option<Multiaddr>,
     user: Option<String>,
     ipv4_addr: Option<Ipv4Addr>,
-    tun: Option<Tun>,
+    tun: Option<T>,
     net: Option<Network<'a>>,
 }
 
-impl<'a> ClientBuilder<'a> {
+impl<'a, T: AsyncRead + AsyncWrite> ClientBuilder<'a, T> {
     /// set the keypair of p2p swarm peer
     pub fn keypair(self, keypair: Keypair) -> Self {
         Self {
@@ -166,7 +154,28 @@ impl<'a> ClientBuilder<'a> {
         }
     }
 
-    pub async fn build(self) -> Option<Client<'a>> {
+    pub fn tun(self, tun: T) -> Self {
+        Self {
+            listen: self.listen,
+            keypair: self.keypair,
+            user: self.user,
+            ipv4_addr: self.ipv4_addr,
+            tun: Some(tun),
+            net: self.net,
+        }
+    }
+
+    pub fn net(self, net: Network<'a>) -> Self {
+        Self {
+            listen: self.listen,
+            keypair: self.keypair,
+            user: self.user,
+            ipv4_addr: self.ipv4_addr,
+            tun: self.tun,
+            net: Some(net),
+        }
+    }
+    pub fn build(self) -> Option<Client<'a, T>> {
         let keypair = self.keypair?;
         let net = self.net?;
         Some(Client {
@@ -186,8 +195,8 @@ impl<'a> ClientBuilder<'a> {
     }
 }
 
-impl<'a> Client<'a> {
-    pub fn builder() -> ClientBuilder<'a> {
+impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
+    pub fn builder() -> ClientBuilder<'a, T> {
         ClientBuilder {
             keypair: None,
             listen: None,
@@ -292,7 +301,7 @@ impl<'a> Client<'a> {
                 let sport = peer.get_exit_tcp_port(&daddr, &dport)?;
                 tcp_packet.set_source_port(sport);
                 tcp_packet.compute_checksum(&saddr, &daddr);
-                self.send_net(ipv4_packet.data()).await?;
+                send(&self.net, ipv4_packet.data()).await?;
             }
             _ => unimplemented!(),
         }
@@ -318,7 +327,7 @@ impl<'a> Client<'a> {
             _ => unimplemented!(),
         };
         ipv4_packet.set_destination_address(daddr);
-        self.send_tun(ipv4_packet.data()).await?;
+        send(&self.tun, ipv4_packet.data()).await?;
         Ok(())
     }
 
@@ -377,30 +386,6 @@ impl<'a> Client<'a> {
         unimplemented!()
     }
 
-    /// send a packet to the external network
-    async fn send_net(&self, data: Vec<u8>) -> Result<()> {
-        let mut fd: MutexGuard<Network> = self.net.lock().unwrap();
-        into_boxed(fd.write_all(&data).await)
-    }
-
-    /// send a packet to the tun device
-    async fn send_tun(&self, data: Vec<u8>) -> Result<()> {
-        let tun: MutexGuard<Tun> = self.tun.lock().unwrap();
-        into_boxed(tun.writer().write_all(&data).await)
-    }
-
-    /// get the next packet from the network
-    async fn next_net_packet(&mut self) -> Result<Vec<u8>> {
-        let mut fd: MutexGuard<Network> = self.net.lock().unwrap();
-        read_vec(&mut *fd).await
-    }
-
-    /// get the next packet from the tunnel
-    async fn next_tun_packet(&mut self) -> Result<Vec<u8>> {
-        let tun: MutexGuard<Tun> = self.tun.lock().unwrap();
-        read_vec(&mut tun.reader()).await
-    }
-
     /// Create p2p swarm and run client.
     pub async fn run(&mut self) -> Result<()> {
         // drop root privileges
@@ -414,8 +399,8 @@ impl<'a> Client<'a> {
         loop {
             use futures::{prelude::*, select};
             select! {
-                packet = self.next_tun_packet() => self.process_tun_packet(packet?, &mut swarm)?,
-                packet = self.next_net_packet() => self.process_net_packet(packet?, &mut swarm)?,
+                packet = next(&self.tun) => self.process_tun_packet(packet?, &mut swarm)?,
+                packet = next(&self.net) => self.process_net_packet(packet?, &mut swarm)?,
                 event = swarm.select_next_some() => match event {
                     SwarmEvent::Behaviour(Event::RequestResponse(RequestResponseEvent::Message {
                         peer,
@@ -478,97 +463,21 @@ async fn make_swarm(id_keys: &Keypair) -> Result<Swarm<Behaviour>> {
     Ok(Swarm::new(transport, behaviour, peer_id))
 }
 
-async fn read_vec<T: AsyncRead + Unpin>(reader: &mut T) -> Result<Vec<u8>> {
+async fn send<T: AsyncWrite + Unpin>(writer: &Mutex<T>, data: Vec<u8>) -> Result<()> {
+    let mut writer: MutexGuard<T> = writer.lock().unwrap();
+    match writer.write_all(&data).await {
+        Ok(t) => Ok(t),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+async fn next<T: AsyncRead + Unpin>(reader: &Mutex<T>) -> Result<Vec<u8>> {
+    let mut reader: MutexGuard<T> = reader.lock().unwrap();
     let mut buf = [0u8; MTU];
     let nbytes = reader.read(&mut buf).await?;
     let mut data = Vec::<u8>::with_capacity(nbytes);
     data.copy_from_slice(&buf);
     Ok(data)
-}
-
-async fn create_tun() -> Result<Tun> {
-    TunBuilder::new()
-        .name("")
-        .tap(false)
-        .packet_info(false)
-        .up()
-        .mtu(MTU as i32)
-        .try_build()
-        .await
-}
-
-mod network {
-    use async_std::{fs::File, os::unix::io::FromRawFd};
-    use futures::{
-        io::{AsyncRead, AsyncWrite, Error},
-        task::{Context, Poll},
-    };
-    use std::{io, net::Ipv4Addr, pin::Pin};
-
-    /// an IP network device
-    pub struct Network<'a> {
-        fd: File,
-        pin: Pin<&'a mut File>,
-        ipv4_addr: Ipv4Addr,
-    }
-
-    impl<'a> Network<'a> {
-        /// create a new network device and resolve
-        /// its ipv4 address using ARP
-        pub fn new() -> io::Result<Self> {
-            // based on https://thomask.sdf.org/blog/2017/09/01/layer-2-raw-sockets-on-rustlinux.html
-            const ETH_P_IP: u16 = 0x0800;
-            use libc::{socket, AF_PACKET, SOCK_RAW};
-            let fd = unsafe {
-                match socket(AF_PACKET, SOCK_RAW, ETH_P_IP.to_be() as i32) {
-                    -1 => return Err(io::Error::last_os_error()),
-                    fd => File::from_raw_fd(fd)
-                }
-            };
-            let ipv4_addr: Ipv4Addr = {
-                //TODO do ARP request
-            };
-            Ok(Self {
-                pin: Pin::new(&mut fd),
-                fd,
-                ipv4_addr,
-            })
-        }
-
-        pub fn get_ipv4_addr(&self) -> &Ipv4Addr {
-            return &self.ipv4_addr
-        }
-    }
-
-    impl<'a> AsyncRead for Network<'a> {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut futures::task::Context<'_>,
-            buf: &mut [u8],
-        ) -> futures::task::Poll<core::result::Result<usize, Error>> {
-            // TODO strip layer 2 headers
-            self.pin.poll_read(cx, buf)
-        }
-    }
-
-    impl<'a> AsyncWrite for Network<'a> {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<core::result::Result<usize, Error>> {
-            // TODO add layer 2 headers
-            self.pin.poll_write(cx, buf)
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-            self.pin.poll_flush(cx)
-        }
-
-        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-            self.pin.poll_close(cx)
-        }
-    }
 }
 
 #[cfg(test)]

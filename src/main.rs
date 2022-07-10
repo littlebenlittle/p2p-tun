@@ -7,14 +7,18 @@ extern crate quickcheck_macros;
 mod behaviour;
 mod client;
 mod config;
+mod network;
 mod packet;
 mod request_response;
+mod tun;
 
 use behaviour::{Behaviour, Event};
 use client::Client;
 use config::Config;
-use packet::{Ipv4Packet, MTU, Port, TcpPacket, Protocol};
-use request_response::{PacketStreamCodec, Destination, PacketStreamProtocol, PacketRequest};
+use network::Network;
+use packet::{Ipv4Packet, Port, Protocol, TcpPacket, MTU};
+use request_response::{Destination, PacketRequest, PacketStreamCodec, PacketStreamProtocol};
+use tun::Tun;
 
 use bimap::BiMap;
 use clap::{Parser, Subcommand};
@@ -86,10 +90,14 @@ fn main() -> Result<()> {
                 }
                 peers
             };
-            async_std::task::block_on(async {
+            async_std::task::block_on(async move {
+                let tun: Tun = Tun::new().await?;
+                let net: Network = Network::new()?;
                 let mut client = Client::builder()
                     .keypair(cfg.keypair())
                     .listen(cfg.listen())
+                    .tun(tun)
+                    .net(net)
                     .build()
                     .unwrap();
                 client.run().await

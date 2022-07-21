@@ -14,6 +14,7 @@ pub const MTU: usize = 1420;
 
 pub type Port = u16;
 
+// TODO deal with IHL header
 #[derive(Debug)]
 pub struct Ipv4Packet<'a>(&'a mut [u8]);
 

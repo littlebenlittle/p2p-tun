@@ -1,8 +1,9 @@
 use crate::{
-    Behaviour, Event, Ipv4Packet, PacketRequest, Port, Protocol::Tcp, Result, TcpPacket, MTU, Network
+    Behaviour, Event, Ipv4Packet, Network, PacketRequest, Port, Protocol::Tcp, Result, TcpPacket,
+    MTU,
 };
 use cidr::Ipv4Cidr;
-use futures::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{
     development_transport,
     identify::{IdentifyEvent, IdentifyInfo},
@@ -18,7 +19,6 @@ use std::{
     str::FromStr,
     sync::{Mutex, MutexGuard},
 };
-
 
 #[derive(Debug)]
 pub enum Error {
@@ -51,7 +51,7 @@ impl std::fmt::Display for Error {
 struct Peer {
     id: PeerId,
     /// tcp ports on local machine for rewriting packets sent to network
-    exit_tcp_ports: HashMap<(Ipv4Addr, Port), Port>,
+    tcp_ports: HashMap<(Ipv4Addr, Port), Port>,
     /// incoming TUN packets matching any CIDR will be sent to the
     /// associated peer
     forward_cidrs: Vec<Ipv4Cidr>,
@@ -62,8 +62,8 @@ struct Peer {
 }
 
 impl Peer {
-    fn get_exit_tcp_port(&self, svc_addr: &Ipv4Addr, svc_port: &Port) -> Result<&Port> {
-        match self.exit_tcp_ports.get(&(*svc_addr, *svc_port)) {
+    fn get_tcp_port(&self, svc_addr: &Ipv4Addr, svc_port: &Port) -> Result<&Port> {
+        match self.tcp_ports.get(&(*svc_addr, *svc_port)) {
             Some(socket) => Ok(socket),
             None => Err(Box::new(Error::NoMatchingPort)),
         }
@@ -71,7 +71,7 @@ impl Peer {
 }
 
 //TODO check for conflicting forward CIDRs between peers
-pub struct Client<'a, T: AsyncRead + AsyncWrite> {
+pub struct Client<T: AsyncRead + AsyncWrite + Unpin, U: AsyncRead + AsyncWrite + Unpin> {
     peer_id: PeerId,
     keypair: Keypair,
     /// client's p2p swarm listen address
@@ -79,9 +79,10 @@ pub struct Client<'a, T: AsyncRead + AsyncWrite> {
     peers: HashMap<PeerId, Peer>,
     /// packets sent from the network through an exit
     /// to this peer will be given this ipv4 source address
-    ipv4_addr: Ipv4Addr,
-    /// ipv4 address of the client on the local network
-    network_ipv4_addr: Ipv4Addr,
+    tun_ipv4_addr: Ipv4Addr,
+    /// listen for packets received from the network on
+    /// this address
+    net_ipv4_addr: Ipv4Addr,
     /// peers known to be associated with a given ipv4 forward addr
     cached_ipv4_peer: HashMap<Ipv4Addr, PeerId>,
     /// peers and daddrs we know we are acting as an exit for
@@ -92,26 +93,28 @@ pub struct Client<'a, T: AsyncRead + AsyncWrite> {
     /// socket addresses associated with remote tcp service
     local_tcp_sockets: HashMap<(Ipv4Addr, Port), (Ipv4Addr, Port)>,
     tun: Mutex<T>,
-    net: Mutex<Network<'a>>,
+    net: Mutex<U>,
 }
 
-struct ClientBuilder<'a, T: AsyncRead + AsyncWrite> {
+struct ClientBuilder<T: AsyncRead + AsyncWrite + Unpin, U: AsyncRead + AsyncWrite + Unpin> {
     keypair: Option<Keypair>,
     listen: Option<Multiaddr>,
     user: Option<String>,
-    ipv4_addr: Option<Ipv4Addr>,
+    tun_ipv4_addr: Option<Ipv4Addr>,
+    net_ipv4_addr: Option<Ipv4Addr>,
     tun: Option<T>,
-    net: Option<Network<'a>>,
+    net: Option<U>,
 }
 
-impl<'a, T: AsyncRead + AsyncWrite> ClientBuilder<'a, T> {
+impl<'a, T: AsyncRead + AsyncWrite + Unpin, U: AsyncRead + AsyncWrite + Unpin> ClientBuilder<T, U> {
     /// set the keypair of p2p swarm peer
     pub fn keypair(self, keypair: Keypair) -> Self {
         Self {
             keypair: Some(keypair),
             listen: self.listen,
             user: self.user,
-            ipv4_addr: self.ipv4_addr,
+            tun_ipv4_addr: self.tun_ipv4_addr,
+            net_ipv4_addr: self.net_ipv4_addr,
             tun: self.tun,
             net: self.net,
         }
@@ -123,7 +126,8 @@ impl<'a, T: AsyncRead + AsyncWrite> ClientBuilder<'a, T> {
             listen: Some(listen.into()),
             keypair: self.keypair,
             user: self.user,
-            ipv4_addr: self.ipv4_addr,
+            tun_ipv4_addr: self.tun_ipv4_addr,
+            net_ipv4_addr: self.net_ipv4_addr,
             tun: self.tun,
             net: self.net,
         }
@@ -135,20 +139,32 @@ impl<'a, T: AsyncRead + AsyncWrite> ClientBuilder<'a, T> {
             listen: self.listen,
             keypair: self.keypair,
             user: Some(user),
-            ipv4_addr: self.ipv4_addr,
+            tun_ipv4_addr: self.tun_ipv4_addr,
+            net_ipv4_addr: self.net_ipv4_addr,
             tun: self.tun,
             net: self.net,
         }
     }
 
-    /// set the ipv4 dest address for packets sent to
-    /// the TUN device
-    pub fn ipv4_addr(self, ipv4_addr: Ipv4Addr) -> Self {
+    pub fn tun_ipv4_addr(self, tun_ipv4_addr: Ipv4Addr) -> Self {
         Self {
             listen: self.listen,
             keypair: self.keypair,
             user: self.user,
-            ipv4_addr: Some(ipv4_addr),
+            tun_ipv4_addr: Some(tun_ipv4_addr),
+            net_ipv4_addr: self.net_ipv4_addr,
+            tun: self.tun,
+            net: self.net,
+        }
+    }
+
+    pub fn net_ipv4_addr(self, net_ipv4_addr: Ipv4Addr) -> Self {
+        Self {
+            listen: self.listen,
+            keypair: self.keypair,
+            user: self.user,
+            net_ipv4_addr: Some(net_ipv4_addr),
+            tun_ipv4_addr: self.tun_ipv4_addr,
             tun: self.tun,
             net: self.net,
         }
@@ -159,49 +175,52 @@ impl<'a, T: AsyncRead + AsyncWrite> ClientBuilder<'a, T> {
             listen: self.listen,
             keypair: self.keypair,
             user: self.user,
-            ipv4_addr: self.ipv4_addr,
+            tun_ipv4_addr: self.tun_ipv4_addr,
+            net_ipv4_addr: self.net_ipv4_addr,
             tun: Some(tun),
             net: self.net,
         }
     }
 
-    pub fn net(self, net: Network<'a>) -> Self {
+    pub fn net(self, net: U) -> Self {
         Self {
             listen: self.listen,
             keypair: self.keypair,
             user: self.user,
-            ipv4_addr: self.ipv4_addr,
+            tun_ipv4_addr: self.tun_ipv4_addr,
+            net_ipv4_addr: self.net_ipv4_addr,
             tun: self.tun,
             net: Some(net),
         }
     }
-    pub fn build(self) -> Option<Client<'a, T>> {
+
+    pub fn build(self) -> Option<Client<T, U>> {
         let keypair = self.keypair?;
-        let net = self.net?;
         Some(Client {
             listen: self.listen?,
-            network_ipv4_addr: *net.get_ipv4_addr(),
+            net_ipv4_addr: self.net_ipv4_addr?,
+            tun_ipv4_addr: self.tun_ipv4_addr?,
             peer_id: keypair.public().to_peer_id(),
             keypair,
             user: users::get_user_by_name(&self.user?)?,
-            ipv4_addr: self.ipv4_addr?,
             peers: HashMap::new(),
             cached_ipv4_peer: HashMap::new(),
             cached_should_exit: HashSet::new(),
             local_tcp_sockets: HashMap::new(),
             tun: Mutex::new(self.tun?),
-            net: Mutex::new(net),
+            net: Mutex::new(self.net?),
         })
     }
 }
 
-impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
-    pub fn builder() -> ClientBuilder<'a, T> {
+impl<'a, T: AsyncRead + AsyncWrite + Unpin, U: AsyncRead + AsyncWrite + Unpin> Client<T, U> {
+    pub fn builder() -> ClientBuilder<T, U> {
         ClientBuilder {
             keypair: None,
             listen: None,
             user: None,
-            ipv4_addr: None,
+            tun_ipv4_addr: None,
+            net_ipv4_addr: None,
             tun: None,
             net: None,
         }
@@ -217,7 +236,7 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
             peer_id,
             Peer {
                 id: peer_id,
-                exit_tcp_ports: HashMap::new(),
+                tcp_ports: HashMap::new(),
                 forward_cidrs,
                 exit_cidrs,
             },
@@ -291,14 +310,14 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
         if !self.should_exit(&peer_id, &daddr) {
             return Err(Box::new(Error::NoMatchCidr));
         }
-        let saddr = self.network_ipv4_addr;
+        let saddr = self.net_ipv4_addr;
         ipv4_packet.set_source_address(&saddr);
         match ipv4_packet.protocol()? {
             Tcp => {
                 let mut tcp_packet = TcpPacket::new(ipv4_packet.payload())?;
                 let dport = tcp_packet.destination_port();
                 let peer = self.peers.get(&peer_id).unwrap();
-                let sport = peer.get_exit_tcp_port(&daddr, &dport)?;
+                let sport = peer.get_tcp_port(&daddr, &dport)?;
                 tcp_packet.set_source_port(sport);
                 tcp_packet.compute_checksum(&saddr, &daddr);
                 send(&self.net, ipv4_packet.data()).await?;
@@ -380,10 +399,20 @@ impl<'a, T: AsyncRead + AsyncWrite + Unpin> Client<'a, T> {
     fn get_source_peer(
         &self,
         remote_addr: &Ipv4Addr,
-        remote_sport: &Port,
+        remote_port: &Port,
         local_port: &Port,
     ) -> Result<&PeerId> {
-        unimplemented!()
+        for (peer_id, peer) in self.peers {
+            match peer.tcp_ports.get(&(*remote_addr, *remote_port)) {
+                Some(port) => {
+                    if port == local_port {
+                        return Ok(&peer_id);
+                    }
+                }
+                None => {}
+            }
+        }
+        Err(Box::new(Error::NoMatchingPort))
     }
 
     /// Create p2p swarm and run client.
@@ -483,7 +512,44 @@ async fn next<T: AsyncRead + Unpin>(reader: &Mutex<T>) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Network, Tun};
 
     #[test]
-    fn test() {}
+    fn test() {
+        let tun_a = Vec::<u8>::new();
+        let tun_b = Vec::<u8>::new();
+        let net_a = Vec::<u8>::new();
+        let net_b = Vec::<u8>::new();
+        // create a fake IP packet
+        let mut packet = vec![
+            0x45, // version 4, IHL 5 (IHL doesn't matter right now, but it will)
+            0,    // DSCP and ECN don't matter
+            0, 0, // total length doesn't matter
+            0, 0, 0, 0, // identifiaction, flags, fragment offset don't matter
+            0, // ttl doesn't matter
+            6, // protocol is TCP
+            0, 0, // we compute checksum later
+            192, 168, 0, 1, // source address
+            127, 0, 0, 1, // destination address
+            771, 9, // TCP source port 12345
+            500, 5, // TCP dest port 8080
+            0, 0, 0, 0, // seq number, doesn't matter
+            0, 0, 0, 0, // ack number, doesn't matter
+            0, 0, 0, 0, // other TCP headers, don't matter
+            0, 0, // compute TCP checksum later
+            0, 0, // urgent pointer, doesn't matter
+            1, 2, 3, 4, 5, // TCP payload
+        ];
+        let mut ipv4_packet = Ipv4Packet::new(&mut packet).unwrap();
+        ipv4_packet.compute_checksum();
+        let a = Client::builder()
+            .keypair(cfg.keypair())
+            .listen(cfg.listen())
+            .tun(tun)
+            .net(net)
+            .tun_ipv4_addr("10.0.1.1".parse().unwrap())
+            .net_ipv4_addr("127.0.0.1".parse().unwrap())
+            .build()
+            .unwrap();
+    }
 }

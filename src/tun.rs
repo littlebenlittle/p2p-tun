@@ -1,11 +1,16 @@
-use crate::{Result, MTU};
+use crate::{MTU};
 use async_tun::{Tun as AsyncTun, TunBuilder};
-use futures::io::{AsyncRead, AsyncWrite};
+use futures::{
+    io::{AsyncRead, AsyncWrite, Error},
+    task::{Context, Poll},
+};
+use std::{io, net::Ipv4Addr, pin::Pin};
+use core::result::Result;
 
 pub struct Tun(AsyncTun);
 
 impl Tun {
-    pub async fn new() -> Result<Tun> {
+    pub async fn new() -> crate::Result<Tun> {
         Ok(Self(
             TunBuilder::new()
                 .name("")
@@ -19,5 +24,31 @@ impl Tun {
     }
 }
 
-impl AsyncRead for Tun {}
-impl AsyncWrite for Tun {}
+impl AsyncRead for Tun {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut futures::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> futures::task::Poll<Result<usize, Error>> {
+        Pin::new(&mut self.0.reader()).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Tun {
+
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        Pin::new(&mut self.0.writer()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.0.writer()).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.0.writer()).poll_close(cx)
+    }
+}

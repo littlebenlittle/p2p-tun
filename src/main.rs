@@ -98,6 +98,8 @@ fn main() -> Result<()> {
                     .listen(cfg.listen())
                     .tun(tun)
                     .net(net)
+                    .tun_ipv4_addr("10.0.1.1".parse().unwrap())
+                    .net_ipv4_addr("127.0.0.1".parse().unwrap())
                     .build()
                     .unwrap();
                 client.run().await

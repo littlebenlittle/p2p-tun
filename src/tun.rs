@@ -1,12 +1,13 @@
-use crate::{MTU};
+use crate::MTU;
 use async_tun::{Tun as AsyncTun, TunBuilder};
+use core::result::Result;
 use futures::{
     io::{AsyncRead, AsyncWrite, Error},
     task::{Context, Poll},
 };
-use std::{io, net::Ipv4Addr, pin::Pin};
-use core::result::Result;
+use std::pin::Pin;
 
+/// Wrapper around async-tun that implements AsyncRead and AsyncWrite
 pub struct Tun(AsyncTun);
 
 impl Tun {
@@ -19,7 +20,7 @@ impl Tun {
                 .up()
                 .mtu(MTU as i32)
                 .try_build()
-                .await?
+                .await?,
         ))
     }
 }
@@ -35,7 +36,6 @@ impl AsyncRead for Tun {
 }
 
 impl AsyncWrite for Tun {
-
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

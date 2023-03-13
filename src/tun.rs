@@ -1,54 +1,44 @@
-use crate::MTU;
-use async_tun::{Tun as AsyncTun, TunBuilder};
-use core::result::Result;
-use futures::{
-    io::{AsyncRead, AsyncWrite, Error},
-    task::{Context, Poll},
-};
-use std::pin::Pin;
+///This was mostly written by ChapGPT, so fingers crossed? Looks OK...
 
-/// Wrapper around async-tun that implements AsyncRead and AsyncWrite
-pub struct Tun(AsyncTun);
+use libc::{ioctl, c_short};
+use nix::request_code_none;
+use async_std::fs::{File, OpenOptions, };
+use std::os::fd::AsRawFd;
+use std::error::Error;
 
-impl Tun {
-    pub async fn new() -> crate::Result<Tun> {
-        Ok(Self(
-            TunBuilder::new()
-                .name("")
-                .tap(false)
-                .packet_info(false)
-                .up()
-                .mtu(MTU as i32)
-                .try_build()
-                .await?,
-        ))
+const TUNSETIFF: u64 = request_code_none!(b'T', 202);
+const IFF_TUN: c_short = 0x0001;
+const IFF_NO_PI: c_short = 0x1000;
+const IFNAMSIZ: usize = 16;
+
+pub async fn new(dev: impl AsRef<str>) -> Result<File, Box<dyn Error + Sync + Send>> {
+    let tun_fd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")
+        .await?;
+    let tun_raw_fd = tun_fd.as_raw_fd();
+    let mut ifr = tun_iface_request(dev.as_ref());
+
+    unsafe {
+        let rc = ioctl(tun_raw_fd, TUNSETIFF, &mut ifr);
+        if rc < 0 {
+            return Err(Box::new(std::io::Error::last_os_error()));
+        }
     }
+    Ok(tun_fd)
 }
 
-impl AsyncRead for Tun {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut futures::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> futures::task::Poll<Result<usize, Error>> {
-        Pin::new(&mut self.0.reader()).poll_read(cx, buf)
-    }
+fn tun_iface_request(ifname: &str) -> IfReq {
+    let mut ifr = IfReq::default();
+    ifr.ifr_name[..ifname.len()].copy_from_slice(ifname.as_bytes());
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    ifr
 }
 
-impl AsyncWrite for Tun {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
-        Pin::new(&mut self.0.writer()).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.0.writer()).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.0.writer()).poll_close(cx)
-    }
+#[repr(C)]
+#[derive(Default)]
+struct IfReq {
+    ifr_name: [u8; IFNAMSIZ],
+    ifr_flags: c_short,
 }

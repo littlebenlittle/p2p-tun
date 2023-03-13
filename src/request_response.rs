@@ -15,6 +15,8 @@ impl ProtocolName for PacketStreamProtocol {
     }
 }
 
+pub struct PacketRequest([u8; MTU]);
+
 #[derive(Debug, Clone)]
 pub struct PacketStreamCodec;
 

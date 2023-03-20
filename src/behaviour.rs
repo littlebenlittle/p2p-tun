@@ -4,6 +4,7 @@ use libp2p::{
     identity,
     kad::{store::MemoryStore, Kademlia, KademliaEvent},
     mdns::{Mdns, MdnsEvent},
+    ping,
     request_response::{ProtocolSupport, RequestResponse, RequestResponseEvent},
     NetworkBehaviour, PeerId,
 };
@@ -15,6 +16,7 @@ pub struct Behaviour {
     pub kademlia: Kademlia<MemoryStore>,
     pub identify: Identify,
     pub mdns: Mdns,
+    pub ping: ping::Behaviour,
 }
 
 impl Behaviour {
@@ -28,6 +30,7 @@ impl Behaviour {
             kademlia: Kademlia::new(peer_id, MemoryStore::new(peer_id)),
             identify: Identify::new(IdentifyConfig::new("ipfs/0.1.0".into(), pub_key)),
             mdns: Mdns::new(Default::default()).await?,
+            ping: ping::Behaviour::new(ping::Config::new().with_keep_alive(true)),
         })
     }
 }
@@ -38,6 +41,7 @@ pub enum Event {
     Kademlia(KademliaEvent),
     Identify(IdentifyEvent),
     Mdns(MdnsEvent),
+    Ping(ping::Event)
 }
 
 impl From<RequestResponseEvent<Vec<u8>, ()>> for Event {
@@ -61,5 +65,11 @@ impl From<IdentifyEvent> for Event {
 impl From<MdnsEvent> for Event {
     fn from(e: MdnsEvent) -> Self {
         Self::Mdns(e)
+    }
+}
+
+impl From<ping::Event> for Event {
+    fn from(e: ping::Event) -> Self {
+        Self::Ping(e)
     }
 }

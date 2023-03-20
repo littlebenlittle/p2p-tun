@@ -1,31 +1,29 @@
 use crate::config::Config;
+use crate::config::VpnPeer;
 use crate::{Behaviour, Event, Result, MTU};
-use crate::{config::VpnPeer};
 use async_std::fs::File;
+use async_std::io::BufWriter;
 use async_tun::Tun;
 use bimap::BiMap;
 use cidr::Ipv4Cidr;
+use etherparse::InternetSlice;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use libp2p::core::network::Peer;
 use libp2p::request_response::RequestId;
 use libp2p::{
     development_transport,
     identify::{IdentifyEvent, IdentifyInfo},
     identity::Keypair,
+    mdns::MdnsEvent,
     request_response::{RequestResponseEvent, RequestResponseMessage},
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
-use std::fmt::Pointer;
-use std::{
-    collections::{HashMap, HashSet},
-    net::Ipv4Addr,
-    str::FromStr,
-    sync::{Mutex, MutexGuard},
-};
+use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
 
 #[derive(Debug)]
 pub enum Error {
-    PrivilegedUser
+    PrivilegedUser,
 }
 
 impl std::fmt::Display for Error {
@@ -36,16 +34,16 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+type ShouldForward = bool;
+
 //TODO check for conflicting forward CIDRs between peers
 pub struct Client {
-    peer_id: PeerId,
-    keypair: Keypair,
     /// client's p2p swarm listen address
     listen: Multiaddr,
     peers: BiMap<PeerId, Ipv4Addr>,
     /// ip address of the tun device
-    tun_ip4: Ipv4Addr,
-    tun: Tun,
+    tun: Option<Tun>,
+    swarm: Swarm<Behaviour>,
 }
 
 impl Client {
@@ -56,61 +54,46 @@ impl Client {
     /// Create p2p swarm and run client.
     pub async fn run(&mut self) -> Result<()> {
         // check that we are not privileged
-        if users::get_current_uid() == 0 || users::get_effective_gid() == 0 || users::get_current_gid() == 0 || users::get_effective_gid() == 0 {
-            return Err(Box::new(Error::PrivilegedUser))
+        if users::get_current_uid() == 0
+            || users::get_effective_gid() == 0
+            || users::get_current_gid() == 0
+            || users::get_effective_gid() == 0
+        {
+            return Err(Box::new(Error::PrivilegedUser));
         }
-        
-        // create swarm
-        let mut swarm = make_swarm(&self.keypair).await?;
-        let _listener_id = swarm.listen_on(self.listen.clone())?;
 
+        let _listener_id = self.swarm.listen_on(self.listen.clone())?;
+        // TODO no need for this to be a contested resource
         let mut packet = [0u8; MTU];
+
         // main loop
-        let mut tun_reader = self.tun.reader();
-        let mut tun_writer = self.tun.writer();
+        let tun = self.tun.take().expect("tun should not be None");
+        let mut tun_reader = tun.reader();
+        let mut tun_writer = tun.writer();
         log::debug!("starting swarm");
         log::debug!("vpn peers:");
         for (peer_id, addr) in &self.peers {
-            log::debug!("{peer_id}: {addr}")
+            log::debug!("{addr}: {peer_id}")
         }
         loop {
             use futures::{prelude::*, select};
             let mut tun_read_fut = tun_reader.read(&mut packet).fuse();
             select! {
                 _ = tun_read_fut => {
-                    log::debug!("received packet on tun");
                     log::trace!("{:?}", packet);
-                    use etherparse::InternetSlice;
-                    let sliced_packet = etherparse::SlicedPacket::from_ip(&packet)?;
-                    match sliced_packet.ip {
-                        Some(InternetSlice::Ipv4(header_slice, _extensions_slice)) => {
-                            let daddr= header_slice.destination_addr();
-                            log::debug!("packet is destined for {daddr}");
-                            if let Some(peer_id) = self.peers.get_by_right(&daddr) {
-                                log::debug!("associated peer: {peer_id}");
-                                swarm
-                                    .behaviour_mut()
-                                    .request_response
-                                    .send_request(peer_id, packet.to_vec());
-                            } else {
-                                log::debug!("no peer corresponding to destination address")
-                            }
-                        },
-                        _ => log::debug!("unsupported packet type")
-                    }
+                    self.handle_tun_packet(packet);
                 }
-                event = swarm.select_next_some() => match event {
+                event = self.swarm.select_next_some() => match event {
                     SwarmEvent::Behaviour(Event::RequestResponse(RequestResponseEvent::Message {
                         peer,
                         message: RequestResponseMessage::Request { request, .. },
                     })) => {
-                        if let Some(saddr) = self.peers.get_by_left(&peer) {
-                            log::debug!("received packet from {peer}");
-                            let packet_saddr = etherparse::Ipv4HeaderSlice::from_slice(&packet)?.source_addr();
-                            if *saddr != packet_saddr {
-                                log::warn!("packet with different source addr received from {peer}: expected {saddr}, got {packet_saddr}");
-                            }
-                            tun_writer.write_all(&request).await?;
+                        packet.copy_from_slice(&request[0..MTU]);
+                        self.handle_peer_packet(peer, packet, &mut tun_writer).await?;
+                    }
+                    SwarmEvent::Behaviour(Event::Mdns(MdnsEvent::Discovered(addresses))) => {
+                        for (peer_id, _) in addresses {
+                            log::debug!("new peer connection: {}", peer_id.to_base58())
                         }
                     }
                     SwarmEvent::Behaviour(_) => {}
@@ -128,6 +111,64 @@ impl Client {
             }
         }
     }
+
+    fn handle_tun_packet(&mut self, packet: [u8; MTU]) {
+        let sliced_packet = match etherparse::SlicedPacket::from_ip(&packet) {
+            Ok(p) => p,
+            Err(e) => {
+                log::info!("could not parse packet received on TUN device");
+                return;
+            }
+        };
+        match sliced_packet.ip {
+            Some(InternetSlice::Ipv4(header_slice, _extensions_slice)) => {
+                let daddr = header_slice.destination_addr();
+                log::debug!("packet is destined for {daddr}");
+                if let Some(peer_id) = self.peers.get_by_right(&daddr) {
+                    log::debug!("associated peer: {peer_id}");
+                    self.swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(peer_id, packet.to_vec());
+                } else {
+                    log::debug!("no peer corresponding to destination address")
+                }
+            }
+            _ => {
+                log::trace!("unsupported packet type");
+            }
+        }
+    }
+
+    async fn handle_peer_packet(
+        &mut self,
+        peer: PeerId,
+        packet: [u8; MTU],
+        tun_writer: &mut BufWriter<&File>,
+    ) -> std::io::Result<()> {
+        if let Some(saddr) = self.peers.get_by_left(&peer) {
+            let sliced_packet = match etherparse::SlicedPacket::from_ip(&packet) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::info!("could not parse packet received on from peer");
+                    return Ok(());
+                }
+            };
+            match sliced_packet.ip {
+                Some(InternetSlice::Ipv4(header_slice, _extensions_slice)) => {
+                    let packet_saddr = header_slice.source_addr();
+                    if packet_saddr != *saddr {
+                        log::warn!("packet with different source addr received from {peer}: expected {saddr}, got {packet_saddr}");
+                    }
+                    tun_writer.write_all(&packet).await?;
+                }
+                _ => {
+                    log::trace!("unsupported packet type");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct ClientBuilder {
@@ -136,19 +177,26 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    pub fn build(self) -> Result<Client> {
+    pub async fn build(self) -> Result<Client> {
         let cfg = self.config.ok_or("config not set")?;
         let mut peers = BiMap::new();
-        for VpnPeer {ip, peer_id} in cfg.peers() {
+        for VpnPeer { ip, peer_id } in cfg.peers() {
             peers.insert(peer_id, ip);
         }
         Ok(Client {
-            peer_id: cfg.peer_id(),
-            keypair: cfg.keypair(),
             listen: cfg.listen(),
-            tun_ip4: cfg.addr(),
             peers,
-            tun: self.tun.ok_or("tun not set")?,
+            tun: Some(self.tun.ok_or("tun not set")?),
+            swarm: {
+                let pub_key = cfg.keypair().public();
+                let peer_id = PeerId::from(pub_key.clone());
+                let transport = development_transport(cfg.keypair()).await?;
+                let mut behaviour = Behaviour::new(peer_id, pub_key).await?;
+                for (peer_id, addr) in cfg.bootaddrs() {
+                    behaviour.kademlia.add_address(&peer_id, addr.clone());
+                }
+                Swarm::new(transport, behaviour, peer_id)
+            },
         })
     }
 
@@ -165,6 +213,7 @@ impl ClientBuilder {
             tun: Some(tun),
         }
     }
+
 }
 
 impl Default for ClientBuilder {
@@ -174,23 +223,4 @@ impl Default for ClientBuilder {
             tun: None,
         }
     }
-}
-
-async fn make_swarm(id_keys: &Keypair) -> Result<Swarm<Behaviour>> {
-    let pub_key = id_keys.public();
-    let peer_id = PeerId::from(pub_key.clone());
-    let transport = development_transport(id_keys.clone()).await?;
-    let mut behaviour = Behaviour::new(peer_id, pub_key).await?;
-    let bootaddr = Multiaddr::from_str("/dnsaddr/bootstrap.libp2p.io")?;
-    for peer in [
-        "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-        "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-        "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-        "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-    ] {
-        behaviour
-            .kademlia
-            .add_address(&PeerId::from_str(peer)?, bootaddr.clone());
-    }
-    Ok(Swarm::new(transport, behaviour, peer_id))
 }

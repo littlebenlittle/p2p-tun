@@ -2,7 +2,6 @@ mod behaviour;
 mod client;
 mod config;
 mod request_response;
-mod tun;
 
 use behaviour::{Behaviour, Event};
 use client::Client;
@@ -76,10 +75,16 @@ fn main() -> Result<()> {
                     .up()
                     .try_build()
                     .await?;
+                // TODO add ip addr to tun
                 log::debug!("switching to user {}", cfg.user());
-                drop_privileges(cfg.user())?;
+                drop_privileges(&cfg.user())?;
                 log::debug!("staring swarm client");
-                let mut client = Client::builder().config(cfg).tun(tun).build().unwrap();
+                let mut client = Client::builder()
+                    .config(cfg)
+                    .tun(tun)
+                    .build()
+                    .await
+                    .unwrap();
                 client.run().await
             })?;
         }

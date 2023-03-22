@@ -185,11 +185,11 @@ impl ClientBuilder {
             swarm_addr,
         } in cfg.peers()
         {
-            peers.insert(peer_id, swarm_addr);
-            peer_routing_table.insert(ip4_addr, peer_id);
+            peers.insert(*peer_id, swarm_addr.clone());
+            peer_routing_table.insert(*ip4_addr, *peer_id);
         }
         Ok(Client {
-            listen: cfg.listen(),
+            listen: cfg.listen().clone(),
             peer_routing_table,
             tun: Some(self.tun.ok_or("tun not set")?),
             swarm: {
@@ -198,7 +198,12 @@ impl ClientBuilder {
                 let transport = development_transport(cfg.keypair()).await?;
                 let mut behaviour = Behaviour::new(peer_id, pub_key).await?;
                 for (peer_id, swarm_addr) in peers {
-                    behaviour.kademlia.add_address(&peer_id, swarm_addr.clone());
+                    if let Some(addr) = swarm_addr {
+                        behaviour.kademlia.add_address(&peer_id, addr.clone());
+                    }
+                }
+                for (peer_id, addr) in cfg.bootaddrs() {
+                    behaviour.kademlia.add_address(&peer_id, addr.clone());
                 }
                 Swarm::new(transport, behaviour, peer_id)
             },

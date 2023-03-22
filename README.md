@@ -10,17 +10,6 @@ This project is a WIP. It does not currently work.
 
 ## Running
 
-### Create a `tun ` device
-
-```sh
-# Create a TUN device named "mytun"
-ip tuntap add mode tun dev mytun
-# Set the IP address for the TUN device
-ip addr add 10.0.1.1/24 dev mytun
-# Bring the TUN device up
-ip link set mytun up
-```
-
 ### Initialize the configuration
 
 ```sh
@@ -28,17 +17,27 @@ ip link set mytun up
 p2p-tun init --config myconfig.yaml
 ```
 
-Modify the config with VPN peer data
+### Modify the config with VPN peer data
 
 ```yaml
 # ...
 peers:
-  - ip: 10.0.1.10
-    peer_id: 12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW
+  - peer_id: 12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW
+    swarm_addr: /ip4/127.0.0.1/tcp/9955
+    ip4_addr: 10.0.1.10
 ```
 
+### Run the app
+
 ```sh
-p2p-tun run --config ./config.yaml --dev mytun
+p2p-tun run --config ./config.yaml
+```
+
+### Configure netfilter
+
+```sh
+sudo ip route add 10.0.1.10 dev tun0
+sudo iptables -t nat -A POSTROUTING -o tun0 -j SNAT --to 10.0.1.1
 ```
 
 ## TODO

@@ -76,9 +76,10 @@ fn main() -> Result<()> {
                     .try_build()
                     .await?;
                 // TODO add ip addr to tun
+                // TODO set netfilter to SNAT properly
                 log::debug!("switching to user {}", cfg.user());
                 drop_privileges(&cfg.user())?;
-                log::debug!("staring swarm client");
+                log::debug!("starting swarm client");
                 let mut client = Client::builder()
                     .config(cfg)
                     .tun(tun)

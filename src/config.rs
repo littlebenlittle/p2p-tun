@@ -7,8 +7,9 @@ use std::{collections::HashMap, net::Ipv4Addr, ops::Mul, str::FromStr};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VpnPeer {
-    pub ip: Ipv4Addr,
+    pub ip4_addr: Ipv4Addr,
     pub peer_id: PeerId,
+    pub swarm_addr: Multiaddr,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -19,8 +20,6 @@ pub struct Config {
     listen: Multiaddr,
     peers: Vec<VpnPeer>,
     user: String,
-    /// addresses to bootstrap kademlia routing
-    bootaddrs: HashMap<PeerId, Multiaddr>,
 }
 
 impl Config {
@@ -40,9 +39,6 @@ impl Config {
     pub fn user(&self) -> String {
         self.user.clone()
     }
-    pub fn bootaddrs(&self) -> HashMap<PeerId, Multiaddr> {
-        self.bootaddrs.clone()
-    }
 }
 
 impl Default for Config {
@@ -61,21 +57,21 @@ impl Default for Config {
             peers,
             listen,
             user: "p2ptun".to_owned(),
-            bootaddrs: {
-                let mut bootaddrs = HashMap::new();
-                for peer in [
-                    "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-                    "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-                    "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-                    "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
-                ] {
-                    bootaddrs.insert(
-                        PeerId::from_str(peer).unwrap(),
-                        Multiaddr::from_str("/dnsaddr/bootstrap.libp2p.io").unwrap(),
-                    );
-                }
-                bootaddrs
-            },
+//            bootaddrs: {
+//                let mut bootaddrs = HashMap::new();
+//                for peer in [
+//                    "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+//                    "QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+//                    "QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+//                    "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+//                ] {
+//                    bootaddrs.insert(
+//                        PeerId::from_str(peer).unwrap(),
+//                        Multiaddr::from_str("/dnsaddr/bootstrap.libp2p.io").unwrap(),
+//                    );
+//                }
+//                bootaddrs
+//            },
         }
     }
 }

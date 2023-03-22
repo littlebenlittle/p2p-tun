@@ -9,6 +9,7 @@ use cidr::Ipv4Cidr;
 use etherparse::InternetSlice;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::core::network::Peer;
+use libp2p::core::DialOpts;
 use libp2p::request_response::RequestId;
 use libp2p::{
     development_transport,
@@ -19,7 +20,7 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
-use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
+use std::{collections::BTreeMap, net::Ipv4Addr, str::FromStr};
 
 #[derive(Debug)]
 pub enum Error {
@@ -34,14 +35,10 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-type ShouldForward = bool;
-
-//TODO check for conflicting forward CIDRs between peers
 pub struct Client {
-    /// client's p2p swarm listen address
     listen: Multiaddr,
-    peers: BiMap<PeerId, Ipv4Addr>,
-    /// ip address of the tun device
+    /// routing table for ip4 destinations and peers
+    peer_routing_table: BiMap<Ipv4Addr, PeerId>,
     tun: Option<Tun>,
     swarm: Swarm<Behaviour>,
 }
@@ -71,8 +68,8 @@ impl Client {
         let mut tun_reader = tun.reader();
         let mut tun_writer = tun.writer();
         log::debug!("starting swarm");
-        log::debug!("vpn peers:");
-        for (peer_id, addr) in &self.peers {
+        log::debug!("peer routing table:");
+        for (addr, peer_id) in &self.peer_routing_table {
             log::debug!("{addr}: {peer_id}")
         }
         loop {
@@ -80,7 +77,7 @@ impl Client {
             let mut tun_read_fut = tun_reader.read(&mut packet).fuse();
             select! {
                 _ = tun_read_fut => {
-                    log::trace!("{:?}", packet);
+                    log::trace!("received packet on tun: {:?}", packet);
                     self.handle_tun_packet(packet);
                 }
                 event = self.swarm.select_next_some() => match event {
@@ -89,6 +86,7 @@ impl Client {
                         message: RequestResponseMessage::Request { request, .. },
                     })) => {
                         packet.copy_from_slice(&request[0..MTU]);
+                        log::trace!("received packet from peer: {} - {:?}", peer.to_base58(), packet);
                         self.handle_peer_packet(peer, packet, &mut tun_writer).await?;
                     }
                     SwarmEvent::Behaviour(Event::Mdns(MdnsEvent::Discovered(addresses))) => {
@@ -124,7 +122,7 @@ impl Client {
             Some(InternetSlice::Ipv4(header_slice, _extensions_slice)) => {
                 let daddr = header_slice.destination_addr();
                 log::debug!("packet is destined for {daddr}");
-                if let Some(peer_id) = self.peers.get_by_right(&daddr) {
+                if let Some(peer_id) = self.peer_routing_table.get_by_left(&daddr) {
                     log::debug!("associated peer: {peer_id}");
                     self.swarm
                         .behaviour_mut()
@@ -146,11 +144,11 @@ impl Client {
         packet: [u8; MTU],
         tun_writer: &mut BufWriter<&File>,
     ) -> std::io::Result<()> {
-        if let Some(saddr) = self.peers.get_by_left(&peer) {
+        if let Some(saddr) = self.peer_routing_table.get_by_right(&peer) {
             let sliced_packet = match etherparse::SlicedPacket::from_ip(&packet) {
                 Ok(p) => p,
-                Err(e) => {
-                    log::info!("could not parse packet received on from peer");
+                Err(_) => {
+                    log::info!("could not parse packet received from peer");
                     return Ok(());
                 }
             };
@@ -179,21 +177,28 @@ pub struct ClientBuilder {
 impl ClientBuilder {
     pub async fn build(self) -> Result<Client> {
         let cfg = self.config.ok_or("config not set")?;
-        let mut peers = BiMap::new();
-        for VpnPeer { ip, peer_id } in cfg.peers() {
-            peers.insert(peer_id, ip);
+        let mut peers = BTreeMap::new();
+        let mut peer_routing_table = BiMap::new();
+        for VpnPeer {
+            ip4_addr,
+            peer_id,
+            swarm_addr,
+        } in cfg.peers()
+        {
+            peers.insert(peer_id, swarm_addr);
+            peer_routing_table.insert(ip4_addr, peer_id);
         }
         Ok(Client {
             listen: cfg.listen(),
-            peers,
+            peer_routing_table,
             tun: Some(self.tun.ok_or("tun not set")?),
             swarm: {
                 let pub_key = cfg.keypair().public();
                 let peer_id = PeerId::from(pub_key.clone());
                 let transport = development_transport(cfg.keypair()).await?;
                 let mut behaviour = Behaviour::new(peer_id, pub_key).await?;
-                for (peer_id, addr) in cfg.bootaddrs() {
-                    behaviour.kademlia.add_address(&peer_id, addr.clone());
+                for (peer_id, swarm_addr) in peers {
+                    behaviour.kademlia.add_address(&peer_id, swarm_addr.clone());
                 }
                 Swarm::new(transport, behaviour, peer_id)
             },
@@ -213,7 +218,6 @@ impl ClientBuilder {
             tun: Some(tun),
         }
     }
-
 }
 
 impl Default for ClientBuilder {

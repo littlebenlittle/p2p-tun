@@ -7,8 +7,8 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "3.1.10", features = ["derive"] }
-libp2p = { version = "0.44", features = ["serde"] }
-libp2p-swarm = { version = "0.35" }
+libp2p = { version = "0.42", features = ["serde"] }
+libp2p-swarm = { version = "0.39" }
 async-std = { version = "1.6.2", features = ["attributes"] }
 futures = "0.3.1"
 futures-util = "0.3"
@@ -23,6 +23,7 @@ users = "0.11"
 etherparse = "0.10"
 cidr = "0.2"
 libc = "0.2"
+nix = { version = "0.26", features = [ "ioctl" ] }
 
 [dev-dependencies]
 quickcheck = "1.0"

@@ -4,7 +4,7 @@ use futures::prelude::*;
 use libp2p::core::upgrade::{read_length_prefixed, write_length_prefixed, ProtocolName};
 use libp2p::request_response::RequestResponseCodec;
 
-use crate::{Packet, MTU};
+use crate::MTU;
 
 #[derive(Clone, Default)]
 pub struct PacketStreamProtocol;
@@ -15,21 +15,7 @@ impl ProtocolName for PacketStreamProtocol {
     }
 }
 
-#[derive(Debug)]
-pub enum PacketRequest {
-    /// data from a local peer destined for a remote service
-    Remote(Vec<u8>),
-    /// data from a remote service destined for the local peer
-    Local(Vec<u8>),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Destination {
-    // request to submit packet to network
-    Net,
-    // request to submit packet to TUN device
-    Tun,
-}
+pub struct PacketRequest([u8; MTU]);
 
 #[derive(Debug, Clone)]
 pub struct PacketStreamCodec;
@@ -37,7 +23,7 @@ pub struct PacketStreamCodec;
 #[async_trait]
 impl RequestResponseCodec for PacketStreamCodec {
     type Protocol = PacketStreamProtocol;
-    type Request = PacketRequest;
+    type Request = Vec<u8>;
     type Response = ();
 
     async fn read_request<T>(
@@ -53,20 +39,20 @@ impl RequestResponseCodec for PacketStreamCodec {
         if vec.is_empty() {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        PacketRequest::from_wire_format(&vec)
+        Ok(vec)
     }
 
     async fn write_request<T>(
         &mut self,
         _: &PacketStreamProtocol,
         io: &mut T,
-        request: PacketRequest,
+        request: Self::Request,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
         // TODO should we use a length prefix if we know MTU?
-        write_length_prefixed(io, request.to_wire_format()).await?;
+        write_length_prefixed(io, request).await?;
         io.close().await?;
         Ok(())
     }

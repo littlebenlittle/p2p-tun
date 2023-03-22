@@ -1,11 +1,5 @@
 # Do No Harm License
 
-Version 0.1, August 2018
-
-https://github.com/raisely/NoHarm
-
-TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
 ## 1. Preamble
 
 Most software today is developed with little to no thought of how it will be used, or the
@@ -117,32 +111,36 @@ conditions:
    or promote products derived from this software without specific prior written permission; and
 
 5. This software must not be used by any organisation, website, product, or service that:
-   1. lobbies for, promotes, or derives a majority of income from actions that support or contribute
-      to:
-      * sex trafficking
-      * human trafficking
-      * slavery
-      * indentured servitude
-      * gambling
-      * tobacco
-      * adversely addictive behaviours
-      * nuclear energy
-      * warfare
-      * weapons manufacturing
-      * war crimes
-      * violence (except when required to protect public safety)
-      * burning of forests
-      * deforestation
-      * hate speech or discrimination based on age, gender, gender identity, race, sexuality, religion, nationality
+   1. promotes, lobbies for or derives a majority of income from:
+         1. **abuses of human rights**:
+            * human trafficking
+            * sex trafficking
+            * slavery or indentured servitude
+            * discrimination based on age, gender, gender identity, race, sexuality, religion, nationality, caste
+            * hate speech
+         2. **environmental destruction**:
+            * the extraction or sale of fossil fuels
+            * the destruction of habitats for threatened or endangered species, including through deforestation or burning of forests
+            * the abuse, inhumane killing or neglect of animals under human control
+            * industrial processes that generate waste products that threaten life
+         3. **conflict and war**:
+            * warfare
+            * war crimes
+            * weapons manufacturing
+            * violence (except when required to protect public safety)
+         4. **addictive or destructive products and services**:
+            * gambling
+            * tobacco
+            * products that encourage adversely addictive behaviours
 
-   2. lobbies against, or derives a majority of income from actions that discourage or frustrate:
+   2. dissuades, lobbies against, or derives a majority of income from actions that discourage or frustrate:
       * peace
-      * access to the rights set out in the Universal Declaration of Human Rights and the Convention on the Rights of the Child
-      * peaceful assembly and association (including worker associations)
-      * a safe environment or action to curtail the use of fossil fuels or prevent climate change
+      * access to the rights set out in the [Universal Declaration of Human Rights](./documents/UDHR.md) and the [Convention on the Rights of the Child](./documents/CRC.md)
       * democratic processes
-
+      * peaceful assembly and association (including worker associations)
+      * a sustainable environment
    ; and
+   
 5. If the Work includes a "NOTICE" text file as part of its distribution, then any Derivative
    Works that You distribute must include a readable copy of the attribution notices contained
    within such NOTICE file, excluding those notices that do not pertain to any part of the
@@ -203,15 +201,9 @@ agree to indemnify, defend, and hold each Contributor harmless for any liability
 claims asserted against, such Contributor by reason of your accepting any such warranty or
 additional liability.
 
-END OF TERMS AND CONDITIONS
+## Attribution
 
-Copyright 2021 Ben Little
+Do No Harm License [Contributor Covenant][homepage], (pre 1.0),
+available at https://github.com/raisely/NoHarm
 
-Licensed under the Do No Harm License, Version 0.1 (the "License"); you may not use this file except
-in compliance with the License. You may obtain a
-[copy](https://github.com/raisely/NoHarm/licenses/apache-2.0.md) of the License.
-
-Unless required by applicable law or agreed to in writing, software distributed under the License is
-distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-implied. See the License for the specific language governing permissions and limitations under the
-License.
+[homepage]: https://github.com/raisely/NoHarm

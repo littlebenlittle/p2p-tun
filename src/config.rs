@@ -1,25 +1,22 @@
 use base58::{FromBase58, FromBase58Error, ToBase58};
 use bimap::BiBTreeMap;
-use cidr::{Ipv4Cidr, errors::NetworkParseError};
+use cidr::{errors::NetworkParseError, Ipv4Cidr};
 use libp2p::{
     identity::{ed25519, error::DecodingError, Keypair},
     Multiaddr, PeerId,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, BTreeMap}, net::Ipv4Addr, str::FromStr};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use crate::PeerRoutingTable;
 
 type Result<T> = std::result::Result<T, Error>;
 
 const PB_BASE58_KEYLEN: usize = 68;
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct VpnPeer {
-    pub ip4_addr: Ipv4Addr,
-    pub peer_id: PeerId,
-    pub swarm_addr: Option<Multiaddr>,
-}
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {
@@ -37,7 +34,7 @@ impl Config {
     pub fn keypair(&self) -> Result<Keypair> {
         keypair_from_base58_proto(&self.keypair)
     }
-    pub fn peer_routing_table(&self) -> Result<PeerRoutingTable>  {
+    pub fn peer_routing_table(&self) -> Result<PeerRoutingTable> {
         let mut rt = BiBTreeMap::new();
         for (cidr, peer_id) in &self.peer_routing_table {
             rt.insert(Ipv4Cidr::from_str(&cidr)?, *peer_id);
@@ -55,42 +52,12 @@ impl Config {
     }
 }
 
-#[derive(Debug)]
-pub enum Error {
-    FromBase58Error(FromBase58Error),
-    InvalidKeyLength(usize),
-    DecodingError(DecodingError),
-    NetworkParseError(NetworkParseError),
-}
-
-impl From<FromBase58Error> for Error {
-    fn from(e: FromBase58Error) -> Self {
-        Self::FromBase58Error(e)
-    }
-}
-
-impl From<DecodingError> for Error {
-    fn from(e: DecodingError) -> Self {
-        Self::DecodingError(e)
-    }
-}
-
-impl From<NetworkParseError> for Error {
-    fn from(e: NetworkParseError) -> Self {
-        Self::NetworkParseError(e)
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::DecodingError(e) => write!(f, "decoding error: {e}"),
-            Self::FromBase58Error(e) => write!(f, "base58 error: {e:?}"),
-            Self::NetworkParseError(e) => write!(f, "network parse error: {e}"),
-            Self::InvalidKeyLength(len) => write!(f, "invalid key length: expected {PB_BASE58_KEYLEN}, got {len}"),
-        }
+impl Config {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let cfg_path = PathBuf::from(path.as_ref());
+        let cfg_str = std::fs::read_to_string(&cfg_path)?;
+        let cfg = serde_yaml::from_str(&cfg_str)?;
+        Ok(cfg)
     }
 }
 
@@ -136,6 +103,64 @@ impl Default for Config {
                 }
                 bootaddrs
             },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    FromBase58Error(FromBase58Error),
+    InvalidKeyLength(usize),
+    DecodingError(DecodingError),
+    NetworkParseError(NetworkParseError),
+    DeserializationError(serde_yaml::Error),
+    IoError(std::io::Error),
+}
+
+impl From<FromBase58Error> for Error {
+    fn from(e: FromBase58Error) -> Self {
+        Self::FromBase58Error(e)
+    }
+}
+
+impl From<DecodingError> for Error {
+    fn from(e: DecodingError) -> Self {
+        Self::DecodingError(e)
+    }
+}
+
+impl From<NetworkParseError> for Error {
+    fn from(e: NetworkParseError) -> Self {
+        Self::NetworkParseError(e)
+    }
+}
+
+impl From<serde_yaml::Error> for Error {
+    fn from(e: serde_yaml::Error) -> Self {
+        Self::DeserializationError(e)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::IoError(e)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DecodingError(e) => write!(f, "decoding error: {e}"),
+            Self::FromBase58Error(e) => write!(f, "base58 error: {e:?}"),
+            Self::NetworkParseError(e) => write!(f, "network parse error: {e}"),
+            Self::IoError(e) => write!(f, "io error: {e}"),
+            Self::DeserializationError(e) => write!(f, "deserialization error: {e}"),
+            Self::InvalidKeyLength(len) => write!(
+                f,
+                "invalid key length: expected {PB_BASE58_KEYLEN}, got {len}"
+            ),
         }
     }
 }

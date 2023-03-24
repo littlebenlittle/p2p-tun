@@ -1,21 +1,20 @@
 use async_std::io::{self};
 use async_trait::async_trait;
 use futures::prelude::*;
-use libp2p::core::upgrade::{read_length_prefixed, write_length_prefixed, ProtocolName};
+use libp2p::core::upgrade::ProtocolName;
 use libp2p::request_response::RequestResponseCodec;
 
 use crate::MTU;
+use crate::Packet;
 
 #[derive(Clone, Default)]
 pub struct PacketStreamProtocol;
 
 impl ProtocolName for PacketStreamProtocol {
     fn protocol_name(&self) -> &[u8] {
-        "/p2p-vpn/0.0.0".as_bytes()
+        "/ip4/0.0.0".as_bytes()
     }
 }
-
-pub struct PacketRequest([u8; MTU]);
 
 #[derive(Debug, Clone)]
 pub struct PacketStreamCodec;
@@ -23,7 +22,7 @@ pub struct PacketStreamCodec;
 #[async_trait]
 impl RequestResponseCodec for PacketStreamCodec {
     type Protocol = PacketStreamProtocol;
-    type Request = Vec<u8>;
+    type Request = Packet;
     type Response = ();
 
     async fn read_request<T>(
@@ -34,12 +33,9 @@ impl RequestResponseCodec for PacketStreamCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        // TODO should we use a length prefix if we know MTU?
-        let vec = read_length_prefixed(io, MTU).await?;
-        if vec.is_empty() {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        Ok(vec)
+        let mut packet = [0u8; MTU];
+        io.read(&mut packet).await?;
+        Ok(packet)
     }
 
     async fn write_request<T>(
@@ -51,8 +47,7 @@ impl RequestResponseCodec for PacketStreamCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        // TODO should we use a length prefix if we know MTU?
-        write_length_prefixed(io, request).await?;
+        io.write(&request).await?;
         io.close().await?;
         Ok(())
     }

@@ -1,11 +1,11 @@
-use crate::{PacketRequest, PacketStreamCodec, PacketStreamProtocol, Result};
+use crate::{PacketStreamCodec, PacketStreamProtocol, Result, PacketEvent};
 use libp2p::{
     identify::{Identify, IdentifyConfig, IdentifyEvent},
     identity,
     kad::{store::MemoryStore, Kademlia, KademliaEvent},
     mdns::{Mdns, MdnsEvent},
     ping,
-    request_response::{ProtocolSupport, RequestResponse, RequestResponseEvent},
+    request_response::{ProtocolSupport, RequestResponse},
     NetworkBehaviour, PeerId,
 };
 
@@ -37,15 +37,15 @@ impl Behaviour {
 
 #[derive(Debug)]
 pub enum Event {
-    RequestResponse(RequestResponseEvent<Vec<u8>, ()>),
+    RequestResponse(PacketEvent),
     Kademlia(KademliaEvent),
     Identify(IdentifyEvent),
     Mdns(MdnsEvent),
     Ping(ping::Event)
 }
 
-impl From<RequestResponseEvent<Vec<u8>, ()>> for Event {
-    fn from(e: RequestResponseEvent<Vec<u8>, ()>) -> Self {
+impl From<PacketEvent> for Event {
+    fn from(e: PacketEvent) -> Self {
         Self::RequestResponse(e)
     }
 }

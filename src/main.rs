@@ -1,30 +1,44 @@
 mod behaviour;
-mod client;
 mod config;
 mod request_response;
 
+use async_std::fs::File;
+use async_std::io::BufWriter;
+use async_tun::Tun;
 use behaviour::{Behaviour, Event};
-use client::Client;
+use bimap::BiBTreeMap;
+use cidr::Ipv4Cidr;
 use config::Config;
-use libc::user;
-use request_response::{PacketRequest, PacketStreamCodec, PacketStreamProtocol};
-
+use etherparse::InternetSlice;
+use futures::io::{AsyncWriteExt};
+use libp2p::{
+    development_transport,
+    mdns::MdnsEvent,
+    request_response::{RequestResponseEvent, RequestResponseMessage},
+    swarm::SwarmEvent,
+    Multiaddr, PeerId, Swarm,
+};
+use request_response::{PacketStreamCodec, PacketStreamProtocol};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Sync + Send>>;
 
 pub(crate) const MTU: usize = 1420;
+pub(crate) type Packet = [u8; MTU];
+pub(crate) type PacketEvent = RequestResponseEvent<Packet, ()>;
+
+pub struct PeerRoutingTable(BiBTreeMap<Ipv4Cidr, PeerId>);
 
 #[derive(Debug)]
 enum Error {
-    NoPeers,
+    PrivilegedUser,
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match self {
-            Error::NoPeers => fmt.write_str("no vpn peers specified in config"),
+            Error::PrivilegedUser => fmt.write_str("swarm should not be run as root"),
         }
     }
 }
@@ -67,6 +81,7 @@ fn main() -> Result<()> {
             };
             async_std::task::block_on(async move {
                 log::debug!("creating tun device");
+                // TODO make configurable
                 let tun = async_tun::TunBuilder::new()
                     .name("")
                     .tap(false)
@@ -80,13 +95,18 @@ fn main() -> Result<()> {
                 log::debug!("switching to user {}", cfg.user());
                 drop_privileges(&cfg.user())?;
                 log::debug!("starting swarm client");
-                let mut client = Client::builder()
-                    .config(cfg)
-                    .tun(tun)
-                    .build()
-                    .await
-                    .unwrap();
-                client.run().await
+                let swarm = {
+                    let keypair = cfg.keypair()?;
+                    let pub_key = keypair.public();
+                    let peer_id = PeerId::from(pub_key.clone());
+                    let transport = development_transport(keypair).await?;
+                    let mut behaviour = Behaviour::new(peer_id, pub_key).await?;
+                    for (peer_id, addr) in cfg.bootaddrs() {
+                        behaviour.kademlia.add_address(&peer_id, addr.clone());
+                    }
+                    Swarm::new(transport, behaviour, peer_id)
+                };
+                start_client(tun, cfg.peer_routing_table()?, swarm, cfg.swarm_addr()).await
             })?;
         }
     }
@@ -102,5 +122,136 @@ fn drop_privileges(username: &str) -> Result<()> {
         .gid();
     users::switch::set_both_gid(gid, gid)?;
     users::switch::set_both_uid(uid, uid)?;
+    Ok(())
+}
+
+async fn start_client(
+    tun: Tun,
+    routing_table: PeerRoutingTable,
+    mut swarm: Swarm<Behaviour>,
+    swarm_addr: Multiaddr,
+) -> Result<()> {
+    // check that we are not privileged
+    if users::get_current_uid() == 0
+        || users::get_effective_gid() == 0
+        || users::get_current_gid() == 0
+        || users::get_effective_gid() == 0
+    {
+        return Err(Box::new(Error::PrivilegedUser));
+    }
+
+    let _listener_id = swarm.listen_on(swarm_addr)?;
+    // TODO no need for this to be a contested resource
+    let mut packet = [0u8; MTU];
+
+    // main loop
+    let mut tun_reader = tun.reader();
+    let mut tun_writer = tun.writer();
+    log::debug!("starting swarm");
+    log::debug!("peer routing table:");
+    for (cidr, peer_id) in &routing_table.0 {
+        log::debug!("{cidr}: {peer_id}")
+    }
+    loop {
+        use futures::{prelude::*, select};
+        let mut tun_read_fut = tun_reader.read(&mut packet).fuse();
+        select! {
+            _ = tun_read_fut => {
+                log::trace!("received packet on tun: {:?}", packet);
+                handle_tun_packet(packet, &routing_table, &mut swarm);
+            }
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(Event::RequestResponse(RequestResponseEvent::Message {
+                    peer,
+                    message: RequestResponseMessage::Request { request, .. },
+                })) => {
+                    packet.copy_from_slice(&request[0..MTU]);
+                    log::trace!("received packet from peer: {} - {:?}", peer.to_base58(), packet);
+                    handle_peer_packet(packet, &routing_table, &peer, &mut tun_writer).await?;
+                }
+                SwarmEvent::Behaviour(Event::Mdns(MdnsEvent::Discovered(addresses))) => {
+                    for (peer_id, _) in addresses {
+                        log::debug!("new peer connection: {}", peer_id.to_base58())
+                    }
+                }
+                SwarmEvent::Behaviour(_) => {}
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    log::info!("now listening on {address:?}");
+                }
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    log::info!("established connection to {}", peer_id.to_base58());
+                }
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    log::info!("closed connection to {}", peer_id.to_base58());
+                }
+                e => log::info!("{e:?}"),
+            }
+        }
+    }
+}
+
+fn handle_tun_packet(
+    packet: [u8; MTU],
+    routing_table: &PeerRoutingTable,
+    swarm: &mut Swarm<Behaviour>,
+) {
+    let sliced_packet = match etherparse::SlicedPacket::from_ip(&packet) {
+        Ok(p) => p,
+        Err(e) => {
+            log::info!("could not parse packet received on TUN device: {e:?}");
+            return;
+        }
+    };
+    match sliced_packet.ip {
+        Some(InternetSlice::Ipv4(header_slice, _extensions_slice)) => {
+            let daddr = header_slice.destination_addr();
+            log::debug!("packet is destined for {daddr}");
+            for (cidr, peer_id) in &routing_table.0 {
+                if cidr.contains(&daddr) {
+                    log::debug!("associated peer: {peer_id}");
+                    swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&peer_id, packet);
+                    return;
+                }
+            }
+            log::debug!("no peer corresponding to destination address")
+        }
+        _ => {
+            log::trace!("unsupported packet type");
+        }
+    }
+}
+
+async fn handle_peer_packet(
+    packet: [u8; MTU],
+    routing_table: &PeerRoutingTable,
+    peer_id: &PeerId,
+    tun_writer: &mut BufWriter<&File>,
+) -> std::io::Result<()> {
+    let sliced_packet = match etherparse::SlicedPacket::from_ip(&packet) {
+        Ok(p) => p,
+        Err(_) => {
+            log::info!("could not parse packet received from peer");
+            return Ok(());
+        }
+    };
+    match sliced_packet.ip {
+        Some(InternetSlice::Ipv4(header_slice, _extensions_slice)) => {
+            if let Some(cidr) = routing_table.0.get_by_right(peer_id) {
+                let saddr = header_slice.source();
+                if cidr.contains(&saddr.into()) {
+                    tun_writer.write_all(&packet).await?;
+                }
+                log::debug!("received packet outside of CIDR route from {}", peer_id.to_base58());
+                log::debug!("expected {cidr}, got {saddr:?}");
+                log::debug!("dropping packet");
+            }
+        }
+        _ => {
+            log::trace!("unsupported packet type");
+        }
+    }
     Ok(())
 }

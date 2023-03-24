@@ -24,19 +24,21 @@ p2p-tun init --config myconfig.yaml
 ```yaml
 # configA.yaml
 # ...
-listen: /ip4/127.0.0.1/tcp/9944
-peers:
-  - peer_id: 12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW
-    swarm_addr: /ip4/127.0.0.1/tcp/9955
-    ip4_addr: 10.0.1.20
+peer_id: 12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq
+swarm_addr: /ip4/127.0.0.1/tcp/9944
+peer_routing_table:
+  0.0.0.0/0: 12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW
+bootaddrs:
+  12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW: /ip4/127.0.0.1/tcp/9955
 
 # configB.yaml
 # ...
-listen: /ip4/127.0.0.1/tcp/9955
-peers:
-  - peer_id: 12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq
-    swarm_addr: /ip4/127.0.0.1/tcp/9944
-    ip4_addr: 10.0.1.10
+peer_id: 12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW
+swarm_addr: /ip4/127.0.0.1/tcp/9955
+peer_routing_table:
+  0.0.0.0/0: 12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq
+bootaddrs:
+  12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq: /ip4/127.0.0.1/tcp/9955
 ```
 
 ### Run the app

@@ -12,6 +12,8 @@ use crate::PeerRoutingTable;
 
 type Result<T> = std::result::Result<T, Error>;
 
+const PB_BASE58_KEYLEN: usize = 68;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VpnPeer {
     pub ip4_addr: Ipv4Addr,
@@ -84,10 +86,10 @@ impl std::error::Error for Error {}
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DecodingError(e) => write!(f, "{e:?}"),
-            Self::FromBase58Error(e) => write!(f, "{e:?}"),
-            Self::NetworkParseError(e) => write!(f, "{e:?}"),
-            Self::InvalidKeyLength(len) => write!(f, "invalid key length: expected 64, got {len}"),
+            Self::DecodingError(e) => write!(f, "decoding error: {e}"),
+            Self::FromBase58Error(e) => write!(f, "base58 error: {e:?}"),
+            Self::NetworkParseError(e) => write!(f, "network parse error: {e}"),
+            Self::InvalidKeyLength(len) => write!(f, "invalid key length: expected {PB_BASE58_KEYLEN}, got {len}"),
         }
     }
 }
@@ -95,7 +97,7 @@ impl std::fmt::Display for Error {
 pub fn keypair_from_base58_proto(keypair: &str) -> Result<Keypair> {
     let keypair_bytes = keypair.from_base58()?;
     match keypair_bytes.len() {
-        64 => Ok(Keypair::from_protobuf_encoding(&keypair_bytes[0..63])?),
+        PB_BASE58_KEYLEN => Ok(Keypair::from_protobuf_encoding(&keypair_bytes)?),
         len => Err(Error::InvalidKeyLength(len)),
     }
 }

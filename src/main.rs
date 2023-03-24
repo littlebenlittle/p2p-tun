@@ -8,9 +8,10 @@ use async_tun::Tun;
 use behaviour::{Behaviour, Event};
 use bimap::BiBTreeMap;
 use cidr::Ipv4Cidr;
+use clap::{Parser, Subcommand};
 use config::Config;
 use etherparse::InternetSlice;
-use futures::io::{AsyncWriteExt};
+use futures::io::AsyncWriteExt;
 use libp2p::{
     development_transport,
     mdns::MdnsEvent,
@@ -19,7 +20,6 @@ use libp2p::{
     Multiaddr, PeerId, Swarm,
 };
 use request_response::{PacketStreamCodec, PacketStreamProtocol};
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Sync + Send>>;
@@ -165,9 +165,8 @@ async fn start_client(
                     peer,
                     message: RequestResponseMessage::Request { request, .. },
                 })) => {
-                    packet.copy_from_slice(&request[0..MTU]);
                     log::trace!("received packet from peer: {} - {:?}", peer.to_base58(), packet);
-                    handle_peer_packet(packet, &routing_table, &peer, &mut tun_writer).await?;
+                    handle_peer_packet(request, &routing_table, &peer, &mut tun_writer).await?;
                 }
                 SwarmEvent::Behaviour(Event::Mdns(MdnsEvent::Discovered(addresses))) => {
                     for (peer_id, _) in addresses {
@@ -243,15 +242,22 @@ async fn handle_peer_packet(
                 let saddr = header_slice.source();
                 if cidr.contains(&saddr.into()) {
                     tun_writer.write_all(&packet).await?;
+                } else {
+                    log::debug!(
+                        "received packet outside of CIDR route from {}",
+                        peer_id.to_base58()
+                    );
+                    log::debug!("expected {cidr}, got {saddr:?}");
+                    log::debug!("dropping packet");
                 }
-                log::debug!("received packet outside of CIDR route from {}", peer_id.to_base58());
-                log::debug!("expected {cidr}, got {saddr:?}");
-                log::debug!("dropping packet");
+            } else {
+                log::debug!("received packet from unknown peer: {}", peer_id.to_base58());
             }
         }
         _ => {
             log::trace!("unsupported packet type");
         }
     }
+    log::trace!("packet: {packet:?}");
     Ok(())
 }

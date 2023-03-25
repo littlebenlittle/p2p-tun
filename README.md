@@ -34,7 +34,7 @@ p2p-tun init --config myconfig.yaml
 # config.yaml of VM A
 # ...
 peer_id: 12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq
-swarm_addr: /ip4/192.168.122.10/tcp/9944
+swarm_addr: /ip4/192.168.122.10/tcp/9955
 peer_routing_table:
   0.0.0.0/0: 12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW
 bootaddrs:
@@ -94,11 +94,11 @@ nc 10.8.0.1 9999
 
 ## TODO
 
-- [ ] modify netfilter rules automatically
+- [ ] configure netfilter automatically
 - [ ] add property based tests
     - incoming and outgoing packets should not cause a `panic!`
-    - packet sent should equal packet received with destination addr modified to match configured ip address of peer
+    - packet sent should equal packet received
     - should drop requests from peer that does not have an associated ip4 address
-    - should not send packets to an ip4 address that does not have an associated peer id
+    - should not send packets to an ip4 address that is not in the CIDR range of an associated peer id
 - [ ] detect packet splitting due to improperly tuned MTU
 - [ ] find a better way to split stuff that needs `root` (creating tun) from stuff that doesn't

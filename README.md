@@ -16,16 +16,10 @@ This example setup is for two VMs running on a VLAN 192.168.122.0/24.
 
 ### Init Config on both VMs
 
-On VM A:
+On both VMs:
 
 ```sh
-p2p-tun init --config myconfig.yaml
-```
-
-On VM B:
-
-```sh
-p2p-tun init --config myconfig.yaml
+p2p-tun init --config config.yaml
 ```
 
 ### Modify config on both VMs

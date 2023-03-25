@@ -12,62 +12,84 @@ Currently capable of establishing a connection with explicit peer swarm addresse
 
 ## Running
 
-### Initialize the configuration
+This example setup is for two VMs running on a VLAN 192.168.122.0/24.
+
+### Init Config on both VMs
+
+On VM A:
 
 ```sh
-# initialize the configuration file
 p2p-tun init --config myconfig.yaml
 ```
 
-### Modify the config with VPN peer data
+On VM B:
+
+```sh
+p2p-tun init --config myconfig.yaml
+```
+
+### Modify config on both VMs
 
 ```yaml
-# configA.yaml
+# config.yaml of VM A
 # ...
 peer_id: 12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq
-swarm_addr: /ip4/127.0.0.1/tcp/9944
+swarm_addr: /ip4/192.168.122.10/tcp/9944
 peer_routing_table:
   0.0.0.0/0: 12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW
 bootaddrs:
-  12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW: /ip4/127.0.0.1/tcp/9955
+  12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW: /ip4/192.168.122.20/tcp/9955
+```
 
-# configB.yaml
+```yaml
+# config.yaml of VM B
 # ...
 peer_id: 12D3KooWBWtFDCDJqDLLd8LDDYU7EuFXEGj34HnpRQ8psfYadboW
-swarm_addr: /ip4/127.0.0.1/tcp/9955
+swarm_addr: /ip4/192.168.122.20/tcp/9955
 peer_routing_table:
   0.0.0.0/0: 12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq
 bootaddrs:
-  12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq: /ip4/127.0.0.1/tcp/9955
+  12D3KooWRd9wxyHnUae7fxVjYV5hDm1CuTwrAxKhYVwGd6Eu4Ssq: /ip4/192.168.122.10/tcp/9955
 ```
 
 ### Run the app
 
+On both VMs:
+
 ```sh
-# shell A
-sudo p2p-tun run --config ./configA.yaml
-# shell B
-sudo p2p-tun run --config ./configB.yaml
+sudo p2p-tun --config ./config.yaml run
 ```
 
 ### Configure netfilter
 
+On VM A:
+
 ```sh
-sudo ip addr add 10.0.1.10 dev tun0
-sudo ip addr add 10.0.1.20 dev tun1
-sudo ip route add 10.0.1.20 dev tun0
-sudo ip route add 10.0.1.10 dev tun1
-sudo iptables -t nat -A POSTROUTING -o tun0 -j SNAT --to 10.0.1.10
-sudo iptables -t nat -A POSTROUTING -o tun1 -j SNAT --to 10.0.1.20
+sudo /sbin/ip addr add 10.8.0.1 dev tun0
+sudo /sbin/route add -host 10.8.0.2 dev tun0
+sudo /sbin/ifconfig tun0 10.8.0.1 up
+```
+
+On VM B:
+
+```sh
+sudo /sbin/ip addr add 10.8.0.2 dev tun1
+sudo /sbin/route add -host 10.8.0.1 dev tun1
+sudo /sbin/ifconfig tun1 10.8.0.2 up
 ```
 
 ### Test Connection
 
+VM A:
+
 ```sh
-# shell 1
-nc -lvp 4040 10.0.1.20
-# shell 2
-nc 10.0.1.20 4040
+nc -lv 10.8.0.1 9999
+```
+
+VM B:
+
+```sh
+nc 10.8.0.1 9999
 ```
 
 ## TODO

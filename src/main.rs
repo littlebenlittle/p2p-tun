@@ -2,7 +2,10 @@ mod behaviour;
 mod config;
 mod request_response;
 
-use async_std::{fs::File, io::BufWriter};
+use async_std::{
+    fs::File,
+    io::{stdin, BufWriter},
+};
 use async_tun::Tun;
 use behaviour::{Behaviour, Event};
 use bimap::BiBTreeMap;
@@ -31,47 +34,39 @@ pub struct PeerRoutingTable(BiBTreeMap<Ipv4Cidr, PeerId>);
 
 #[derive(Parser)]
 struct Opts {
+    #[clap(long, default_value = "./config.yaml")]
+    config: String,
     #[clap(subcommand)]
     command: CliCommand,
 }
 
 #[derive(Subcommand)]
 enum CliCommand {
-    Init {
-        #[clap(long, default_value = "./config.yaml")]
-        config: String,
-    },
-    Run {
-        #[clap(long, default_value = "./config.yaml")]
-        config: String,
-    },
-    /// Create tun and dump packets for debugging instead of forwarding
-    /// to peer
-    Dump {
-        #[clap(long, default_value = "./config.yaml")]
-        config: String,
-    },
+    Init,
+    Run,
+    /// Create tun and dump packets for debugging instead of forwarding to peer
+    Dump,
+    /// Create tun and write fake packets to it for debug
+    Fake,
 }
 
 fn main() -> Result<()> {
     env_logger::init();
     let opts = Opts::parse();
+    use CliCommand::*;
     match opts.command {
-        CliCommand::Init { config } => {
-            let cfg_path = PathBuf::from(config);
+        Init => {
             let cfg = Config::default();
+            let cfg_path = PathBuf::from(opts.config);
             if cfg_path.exists() {
                 println!("config path already exists; not overwriting")
             } else {
                 std::fs::write(cfg_path, serde_yaml::to_string(&cfg)?)?;
             }
         }
-        CliCommand::Run { config } => {
-            async_std::task::block_on(run(Config::from_path(config)?))?;
-        }
-        CliCommand::Dump { config } => {
-            async_std::task::block_on(dump(Config::from_path(config)?))?;
-        }
+        Run => async_std::task::block_on(run(Config::from_path(opts.config)?))?,
+        Dump => async_std::task::block_on(dump(Config::from_path(opts.config)?))?,
+        Fake => async_std::task::block_on(fake(Config::from_path(opts.config)?))?,
     }
     Ok(())
 }
@@ -100,22 +95,23 @@ async fn run(cfg: Config) -> Result<()> {
     let mut packet = [0u8; MTU];
 
     // main loop
-    let mut tun_reader = tun.reader();
-    let mut tun_writer = tun.writer();
+    let (mut tun_reader, mut tun_writer) = tun.split();
     log::debug!("starting swarm");
     log::debug!("peer routing table:");
     for (cidr, peer_id) in &routing_table.0 {
         log::debug!("{cidr}: {peer_id}")
     }
     loop {
-        let mut tun_read_fut = tun_reader.read(&mut packet).fuse();
+        log::debug!("main loop");
         select! {
-            _ = tun_read_fut => {
+            _ = tun_reader.read(&mut packet).fuse() => {
                 if let Some(peer_id) = handle_tun_packet(packet, &routing_table) {
+                    log::debug!("sending packet to peer");
                     swarm
                         .behaviour_mut()
                         .request_response
                         .send_request(&peer_id, packet);
+                    log::debug!("finished sending packet to peer");
                 }
             }
             event = swarm.select_next_some() => match event {
@@ -123,14 +119,20 @@ async fn run(cfg: Config) -> Result<()> {
                     peer,
                     message: RequestResponseMessage::Request { request, .. },
                 })) => {
-                    log::trace!("received packet from peer: {} - {:?}", peer.to_base58(), packet);
-                    handle_peer_packet(request, &routing_table, &peer, &mut tun_writer).await?;
+                    if handle_peer_packet(request, &routing_table, &peer).await? {
+                        log::debug!("writing packet to tun device");
+                        let n = tun_writer.write(&request).await?;
+                        log::debug!("wrote {n} bytes");
+                        log::debug!("flushing writer");
+                        tun_writer.flush().await?;
+                        log::debug!("finished writing packet to tun device");
+                   }
                 }
-                SwarmEvent::Behaviour(Event::Mdns(MdnsEvent::Discovered(addresses))) => {
-                    for (peer_id, _) in addresses {
-                        log::debug!("new peer connection: {}", peer_id.to_base58())
-                    }
-                }
+                // SwarmEvent::Behaviour(Event::Mdns(MdnsEvent::Discovered(addresses))) => {
+                //     for (peer_id, _) in addresses {
+                //         log::debug!("new peer connection: {}", peer_id.to_base58())
+                //     }
+                // }
                 SwarmEvent::Behaviour(_) => {}
                 SwarmEvent::NewListenAddr { address, .. } => {
                     log::info!("now listening on {address:?}");
@@ -166,6 +168,31 @@ async fn dump(cfg: Config) -> Result<()> {
     Result::<()>::Ok(())
 }
 
+async fn fake(cfg: Config) -> Result<()> {
+    log::info!("creating tun device");
+    let tun = setup_tun(&cfg).await?;
+    log::info!("switching to user {}", cfg.user());
+    drop_privileges(&cfg.user())?;
+    let mut tun_writer = tun.writer();
+    let mut counter = 0u8;
+    let stdin = async_std::io::stdin();
+    let mut line = String::new();
+    loop {
+        let packet_builder =
+            etherparse::PacketBuilder::ipv4([1, 2, 3, 4], [4, 3, 2, 1], 30).udp(1234, 4321);
+        let payload = [counter];
+        let mut packet = Vec::with_capacity(packet_builder.size(1));
+        packet_builder.write(&mut packet, &payload)?;
+        log::debug!("writing packet to {}", tun.name());
+        tun_writer.write(&packet).await?;
+        tun_writer.flush().await?;
+        log::debug!("finished writing packet to {}", tun.name());
+        stdin.read_line(&mut line).await?;
+        counter += 1;
+    }
+    Result::<()>::Ok(())
+}
+
 async fn setup_tun(cfg: &Config) -> Result<Tun> {
     // TODO make configurable
     let tun = async_tun::TunBuilder::new()
@@ -193,7 +220,7 @@ fn drop_privileges(username: &str) -> Result<()> {
 }
 
 fn handle_tun_packet(packet: [u8; MTU], routing_table: &PeerRoutingTable) -> Option<&PeerId> {
-    log::info!("received packet on tun: {:?}", packet);
+    log::debug!("received packet on tun");
     let sliced_packet = match etherparse::SlicedPacket::from_ip(&packet) {
         Ok(p) => p,
         Err(e) => {
@@ -226,21 +253,23 @@ async fn handle_peer_packet(
     packet: [u8; MTU],
     routing_table: &PeerRoutingTable,
     peer_id: &PeerId,
-    tun_writer: &mut BufWriter<&File>,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
+    log::debug!("received packet from peer");
+    log::trace!("packet: {:?}", packet);
     let sliced_packet = match etherparse::SlicedPacket::from_ip(&packet) {
         Ok(p) => p,
         Err(_) => {
             log::info!("could not parse packet received from peer");
-            return Ok(());
+            return Ok(false);
         }
     };
     match sliced_packet.ip {
         Some(InternetSlice::Ipv4(header_slice, _extensions_slice)) => {
             if let Some(cidr) = routing_table.0.get_by_right(peer_id) {
                 let saddr = header_slice.source();
+                log::debug!("src: {saddr:?}, dst: {:?}", header_slice.destination());
                 if cidr.contains(&saddr.into()) {
-                    tun_writer.write_all(&packet).await?;
+                    return Ok(true);
                 } else {
                     log::debug!(
                         "received packet outside of CIDR route from {}",
@@ -258,5 +287,5 @@ async fn handle_peer_packet(
         }
     }
     log::trace!("packet: {packet:?}");
-    Ok(())
+    Ok(false)
 }

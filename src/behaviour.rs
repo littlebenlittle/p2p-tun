@@ -15,7 +15,7 @@ pub struct Behaviour {
     pub request_response: RequestResponse<PacketStreamCodec>,
     pub kademlia: Kademlia<MemoryStore>,
     pub identify: Identify,
-    pub mdns: Mdns,
+    // pub mdns: Mdns,
     pub ping: ping::Behaviour,
 }
 
@@ -29,7 +29,7 @@ impl Behaviour {
             ),
             kademlia: Kademlia::new(peer_id, MemoryStore::new(peer_id)),
             identify: Identify::new(IdentifyConfig::new("ipfs/0.1.0".into(), pub_key)),
-            mdns: Mdns::new(Default::default()).await?,
+            // mdns: Mdns::new(Default::default()).await?,
             ping: ping::Behaviour::new(ping::Config::new().with_keep_alive(true)),
         })
     }
@@ -40,7 +40,7 @@ pub enum Event {
     RequestResponse(PacketEvent),
     Kademlia(KademliaEvent),
     Identify(IdentifyEvent),
-    Mdns(MdnsEvent),
+    // Mdns(MdnsEvent),
     Ping(ping::Event)
 }
 
@@ -62,11 +62,11 @@ impl From<IdentifyEvent> for Event {
     }
 }
 
-impl From<MdnsEvent> for Event {
-    fn from(e: MdnsEvent) -> Self {
-        Self::Mdns(e)
-    }
-}
+// impl From<MdnsEvent> for Event {
+//     fn from(e: MdnsEvent) -> Self {
+//         Self::Mdns(e)
+//     }
+// }
 
 impl From<ping::Event> for Event {
     fn from(e: ping::Event) -> Self {
